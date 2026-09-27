@@ -1,0 +1,32 @@
+# ===== 大文件: 权重/视频/压缩包 =====
+*.pt
+*.pth
+*.onnx
+*.mp4
+*.avi
+*.mkv
+*.mov
+*.zip
+*.rar
+*.7z
+*.pdf
+
+# ===== 输出目录 =====
+outputs/
+
+# ===== Python 缓存 =====
+__pycache__/
+*.pyc
+*.pyo
+
+# ===== 编译产物 =====
+*.o
+*.so
+*.dll
+
+# ===== WorkBuddy 会话数据 =====
+.workbuddy/
+
+# ===== 系统/编辑器 =====
+Thumbs.db
+.DS_Store

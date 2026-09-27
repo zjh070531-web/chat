@@ -1,0 +1,21 @@
+1. 图片放入test_DetHPE \ CrowdHuman里
+
+2. 运行命令
+python image.py DAD-COCOHead-ResNet50-best --is_full_range  --config settings/DAD3DHeads_COCOHead.yml --network resnet50 --gpu_ids 1 --ref_yaw -60 --ref_pitch 70 --turn_thres 30 --two_sided
+
+
+| 参数 | 含义 |
+|---|---|
+| `python image.py` | 运行图片推理脚本（对图片做人体/头部检测 + 头部姿态估计） |
+| `DAD-COCOHead-ResNet50-best` | 权重名，程序会去 `weights\DAD-COCOHead-ResNet50-best.pth` 加载发布模型 |
+| `--is_full_range` | 全角度模式（360°），模型按完整范围输出 yaw/pitch；不加则是正脸范围 |
+| `--config settings\DAD3DHeads_COCOHead.yml` | 配置文件，里面是数据集路径、训练配置、网络等默认参数 |
+| `--network resnet50` | 网络骨架用 ResNet50，必须和权重对应 |
+| `--gpu_ids 1` | 指定 GPU；你只有 CPU 时这个参数会被忽略，程序自动用 CPU 跑 |
+| `--ref_yaw -150` | 参考「直视」方向的 yaw（度），即你觉得“正常看卷子”应该朝的方向 |
+| `--ref_pitch 20` | 参考方向的 pitch（度） |
+| `--turn_thres 30` | 判定阈值（度）：头的面朝线（蓝线）和参考线（白线）的最小夹角超过 30° 就标 TURNED |
+| `--two_sided` | 双向参考：参考方向加上它的延长线（yaw+180、pitch 不变）都算“直视”，适合考场面对面坐的情况 |
+
+
+3. 结果在test_DetHPE \ CrowdHuman里 图片名为原图名_BDJDetSemiUHPE.jpg

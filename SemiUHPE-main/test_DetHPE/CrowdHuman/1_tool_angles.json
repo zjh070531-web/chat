@@ -1,0 +1,202 @@
+{
+  "image": "C:\\Users\\Administrator\\Desktop\\SemiUHPE-main\\test_DetHPE\\CrowdHuman\\1.png",
+  "ref_yaw": -8.61,
+  "turn_thres": 45.0,
+  "heads": [
+    {
+      "bbox": [
+        1319,
+        127,
+        1369,
+        176
+      ],
+      "yaw": -37.63,
+      "pitch": -12.59,
+      "roll": 10.16,
+      "yaw_diff_to_ref": -29.02,
+      "turned": false
+    },
+    {
+      "bbox": [
+        507,
+        902,
+        673,
+        1069
+      ],
+      "yaw": -70.3,
+      "pitch": 160.8,
+      "roll": -168.24,
+      "yaw_diff_to_ref": -61.69,
+      "turned": true
+    },
+    {
+      "bbox": [
+        1681,
+        829,
+        1823,
+        971
+      ],
+      "yaw": -5.08,
+      "pitch": -65.45,
+      "roll": -11.89,
+      "yaw_diff_to_ref": 3.53,
+      "turned": false
+    },
+    {
+      "bbox": [
+        986,
+        341,
+        1052,
+        406
+      ],
+      "yaw": -48.45,
+      "pitch": 15.56,
+      "roll": 1.07,
+      "yaw_diff_to_ref": -39.84,
+      "turned": false
+    },
+    {
+      "bbox": [
+        722,
+        325,
+        782,
+        385
+      ],
+      "yaw": 3.51,
+      "pitch": 9.23,
+      "roll": 15.66,
+      "yaw_diff_to_ref": 12.12,
+      "turned": false
+    },
+    {
+      "bbox": [
+        1050,
+        569,
+        1191,
+        710
+      ],
+      "yaw": -25.67,
+      "pitch": -19.6,
+      "roll": 3.02,
+      "yaw_diff_to_ref": -17.06,
+      "turned": false
+    },
+    {
+      "bbox": [
+        709,
+        425,
+        811,
+        528
+      ],
+      "yaw": 64.01,
+      "pitch": -25.76,
+      "roll": -37.83,
+      "yaw_diff_to_ref": 72.61,
+      "turned": true
+    },
+    {
+      "bbox": [
+        1305,
+        431,
+        1407,
+        533
+      ],
+      "yaw": -60.7,
+      "pitch": 154.94,
+      "roll": -145.36,
+      "yaw_diff_to_ref": -52.09,
+      "turned": true
+    },
+    {
+      "bbox": [
+        1855,
+        544,
+        1962,
+        651
+      ],
+      "yaw": -0.12,
+      "pitch": -5.95,
+      "roll": 12.62,
+      "yaw_diff_to_ref": 8.49,
+      "turned": false
+    },
+    {
+      "bbox": [
+        115,
+        574,
+        192,
+        651
+      ],
+      "yaw": -70.56,
+      "pitch": 51.65,
+      "roll": -44.06,
+      "yaw_diff_to_ref": -61.95,
+      "turned": true
+    },
+    {
+      "bbox": [
+        423,
+        417,
+        508,
+        502
+      ],
+      "yaw": 25.58,
+      "pitch": -18.98,
+      "roll": -14.18,
+      "yaw_diff_to_ref": 34.18,
+      "turned": false
+    },
+    {
+      "bbox": [
+        1321,
+        273,
+        1394,
+        345
+      ],
+      "yaw": 29.83,
+      "pitch": -0.88,
+      "roll": -2.34,
+      "yaw_diff_to_ref": 38.44,
+      "turned": false
+    },
+    {
+      "bbox": [
+        1657,
+        352,
+        1732,
+        428
+      ],
+      "yaw": 20.18,
+      "pitch": -14.24,
+      "roll": 0.51,
+      "yaw_diff_to_ref": 28.79,
+      "turned": false
+    },
+    {
+      "bbox": [
+        1003,
+        241,
+        1070,
+        308
+      ],
+      "yaw": 32.97,
+      "pitch": 0.72,
+      "roll": -4.93,
+      "yaw_diff_to_ref": 41.57,
+      "turned": false
+    },
+    {
+      "bbox": [
+        262,
+        652,
+        354,
+        744
+      ],
+      "yaw": -82.73,
+      "pitch": 151.25,
+      "roll": -149.98,
+      "yaw_diff_to_ref": -74.12,
+      "turned": true
+    }
+  ]
+}

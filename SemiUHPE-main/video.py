@@ -2,12 +2,13 @@
 r"""
 交头接耳检测 v1 (精简版, 从零手写)
 
-判定逻辑只有三件事:
+判定逻辑四步:
   ① 座位约束  - 只判同一排的左右邻座 (前后排的人直接排除)
   ② 视线夹角  - 两人头部朝向夹角达到钝角 = 相互对看 (= 交头接耳)
   ③ 一对一匹配 - 按夹角排序贪心, 一个人只能和一个人配对
+  ④ 时序平滑  - 同一配对连续命中若干处理帧才确认, 确认后允许短暂漏检
 
-已去掉的东西: yaw时序信任 / 8道关卡 / 加权评分 / 追踪补位 / 时序平滑 / 3D头模 / 多进程 / GIF
+已去掉的东西: yaw时序信任 / 8道关卡 / 加权评分 / 追踪补位 / 3D头模 / 多进程 / GIF
 设计取舍: 宁可漏检, 不要误判; 所有可调参数都在下面【参数】区
 
 位置: D:\chatting\SemiUHPE-main\video.py  (与 src/ utils/ models/ weights/ 同级)
@@ -107,6 +108,14 @@ NEIGHBOR_DX_RATIO = 0.5      # 左右相邻: 水平距离 ≥ 垂直距离×该�
 GAZE_OBTUSE_THRESH = 100.0   # 夹角 ≥ 该值判为交头接耳 (慢慢试: 90~130)
 MIN_TURN_YAW = 10.0          # 每人至少转头该角度 (没转头不可能在说话)
 
+# ---- ④ 时序平滑 (跨帧确认, 压掉单帧偶发误判) ★第二调节点 ----
+# 语义: 同一个配对要连续命中 SMOOTH_CONFIRM_FRAMES 个"处理帧"才输出;
+#       确认后即使漏检, 也能靠 SMOOTH_HOLD_FRAMES 撑住几帧不闪断。
+SMOOTH_ENABLE = True          # 关掉 = 退回"单帧命中即输出"
+SMOOTH_CONFIRM_FRAMES = 2     # 连续命中几帧才确认 (FRAME_SKIP=3 + 25fps 时 1帧≈0.12秒)
+SMOOTH_HOLD_FRAMES = 2        # 确认后容忍连续漏检几帧 (防闪烁/缓解漏检)
+SMOOTH_MATCH_DIST = 0.8       # 跨帧"同一个配对"的匹配上限 (×平均头高); 调太大易串配对
+
 # ---- 模型设置 (勿改) ----
 DEVICE = 'cuda:0'
 IMGSZ = 960
@@ -180,12 +189,92 @@ def one_to_one(pairs):
 
 
 # ==============================================================================
+# ④ 时序平滑: 跨帧确认 (不使用追踪器, 直接按头中心就近认领"同一个配对")
+# ==============================================================================
+class PairSmoother:
+    """同一个配对连续命中 N 帧才确认; 确认后允许短暂漏检。
+
+    tracks 每项: {'a':(x,y), 'b':(x,y), 'consec': 连续命中帧数, 'hold': 还能容忍几次漏检}
+    """
+
+    def __init__(self, confirm_frames, hold_frames, match_dist_ratio):
+        self.confirm = max(1, int(confirm_frames))
+        self.hold_max = max(0, int(hold_frames))
+        self.ratio = float(match_dist_ratio)
+        self.tracks = []
+
+    def _dist(self, t, ha, hb):
+        """配对距离 = 两头中心距离的平均; 允许 a/b 顺序互换"""
+        d1 = math.hypot(t['a'][0] - ha['cx'], t['a'][1] - ha['cy']) + \
+             math.hypot(t['b'][0] - hb['cx'], t['b'][1] - hb['cy'])
+        d2 = math.hypot(t['a'][0] - hb['cx'], t['a'][1] - hb['cy']) + \
+             math.hypot(t['b'][0] - ha['cx'], t['b'][1] - ha['cy'])
+        return min(d1, d2) * 0.5
+
+    def update(self, pairs, heads):
+        """pairs: [(i, j, gaze)]; heads: [{cx,cy,bbox,...}]; 返回确认后要画的 pairs"""
+        avg_head = 0.0
+        if heads:
+            avg_head = sum(h['bbox'][3] - h['bbox'][1] for h in heads) / float(len(heads))
+        limit = self.ratio * avg_head if avg_head > 0 else 0.0
+
+        claimed = set()      # 本轮已被认领的 tracks 下标 (含新建的)
+        confirmed = []
+
+        for (i, j, gaze) in pairs:
+            ha, hb = heads[i], heads[j]
+            # 就近认领历史配对: 距离最小且在 limit 内
+            best, best_d = -1, None
+            for ti, t in enumerate(self.tracks):
+                if ti in claimed:
+                    continue
+                d = self._dist(t, ha, hb)
+                if d <= limit and (best_d is None or d < best_d):
+                    best, best_d = ti, d
+
+            if best < 0:                                  # 没见过 → 新建
+                self.tracks.append({'a': (ha['cx'], ha['cy']), 'b': (hb['cx'], hb['cy']),
+                                    'consec': 1, 'hold': 0})
+                claimed.add(len(self.tracks) - 1)
+                if self.confirm <= 1:                     # 阈值=1 时首帧即确认
+                    confirmed.append((i, j, gaze))
+            else:                                         # 命中 → 累加
+                claimed.add(best)
+                t = self.tracks[best]
+                t['a'] = (ha['cx'], ha['cy'])
+                t['b'] = (hb['cx'], hb['cy'])
+                t['consec'] += 1
+                t['hold'] = self.hold_max
+                if t['consec'] >= self.confirm:
+                    confirmed.append((i, j, gaze))
+
+        # 本轮没出现的配对: 消耗 hold, 同时 consec 衰减; hold 用完则删除
+        alive = []
+        for ti, t in enumerate(self.tracks):
+            if ti in claimed:
+                alive.append(t)
+                continue
+            t['hold'] -= 1
+            if t['hold'] > 0:
+                t['consec'] = max(0, t['consec'] - 1)
+                alive.append(t)
+        self.tracks = alive
+        return confirmed
+
+
+# ==============================================================================
 # 主流程
 # ==============================================================================
 if __name__ == '__main__':
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     video_files = sorted(glob.glob(os.path.join(VIDEO_DIR, "*.mp4")))
     print(f"[输入] {VIDEO_DIR}\n[输出] {OUTPUT_DIR}\n[视频] {len(video_files)} 个")
+    if SMOOTH_ENABLE:
+        print(f"[时序] 平滑开: 连续 {SMOOTH_CONFIRM_FRAMES} 个处理帧确认, "
+              f"确认后容忍漏检 {SMOOTH_HOLD_FRAMES} 帧 "
+              f"(1 个处理帧 = {FRAME_SKIP} 帧原始画面)")
+    else:
+        print("[时序] 平滑关: 单帧命中即输出")
 
     # ---------- 加载 SemiUHPE (头姿) ----------
     sys.argv = ['video.py', 'DAD-COCOHead-ResNet50-best', '--is_full_range',
@@ -230,7 +319,12 @@ if __name__ == '__main__':
         if writer is None or not writer.isOpened():
             print("!! 无法创建输出视频, 跳过"); continue
 
+        # 时序平滑状态 (每个视频重置)
+        smoother = PairSmoother(SMOOTH_CONFIRM_FRAMES if SMOOTH_ENABLE else 1,
+                                SMOOTH_HOLD_FRAMES if SMOOTH_ENABLE else 0,
+                                SMOOTH_MATCH_DIST)
         total_chat = 0
+        total_raw = 0
         for fi, (path, img, im0, _) in enumerate(tqdm(dataset, desc=name)):
             if fi % FRAME_SKIP != 0:
                 continue
@@ -314,10 +408,14 @@ if __name__ == '__main__':
                                   'bbox': rb, 'yaw': yaw, 'pitch': pitch, 'roll': roll})
 
             # ===== 4. 判定: 座位约束 + 视线夹角钝角 → 一对一匹配 =====
-            pairs = one_to_one(judge_pairs(heads, img_w))
+            raw_pairs = one_to_one(judge_pairs(heads, img_w))
+            total_raw += len(raw_pairs)
+
+            # ===== 5. 时序平滑: 同一配对连续命中若干处理帧才确认 =====
+            pairs = smoother.update(raw_pairs, heads)
             total_chat += len(pairs)
 
-            # ===== 5. 画结果 =====
+            # ===== 6. 画结果 =====
             for (i, j, gaze) in pairs:
                 a, b = heads[i], heads[j]
                 cv2.line(im0, (int(a['cx']), int(a['cy'])), (int(b['cx']), int(b['cy'])),
@@ -337,6 +435,6 @@ if __name__ == '__main__':
                 writer.write(out)
 
         writer.release()
-        print(f"已保存: {out_path}  (共 {total_chat} 对次)")
+        print(f"已保存: {out_path}  (原始 {total_raw} 对次 → 时序确认 {total_chat} 对次)")
 
     print("\n全部完成!")

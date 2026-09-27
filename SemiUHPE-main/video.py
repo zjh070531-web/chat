@@ -102,8 +102,20 @@ HEAD_MIN_RATIO, HEAD_MAX_RATIO = 0.015, 0.35   # 头宽占图宽的比例范围
 
 # ---- ① 座位约束 ----
 ROW_Y_RATIO = 1.2            # 同排判定: 两头中心高度差 ≤ 该倍数×平均头高 (前后排排除)
-SEAT_DIST_RATIO = 0.35       # 邻座判定: 两头水平距离 ≤ 该比例×图宽
+NEAR_DX_RATIO = 3.0          # ★邻座判定: 两头水平距离 ≤ 该倍数×平均头高 (尺度无关!)
+                             #   肩并肩坐着的人头距 ≈ 肩宽 ≈ 2 倍头高, 故 3.0 留了一点余量。
+                             #   旧版用的是 SEAT_DIST_RATIO=0.35×图宽, 那是"按画面宽度"算的,
+                             #   在 4K 画面里 ≈ 1344px ≈ 13 倍头高, 会把隔 3~4 个座位的人
+                             #   也当成"邻座", 是误判的一大来源 —— 已废弃。
 NEIGHBOR_DX_RATIO = 0.5      # 左右相邻: 水平距离 ≥ 垂直距离×该比例
+
+# ---- 两人区域裁剪规格 (★训练与推理必须完全一致, 改这里两边一起变) ----
+# 以两头中心连线的中点为心作正方形, 边长只由"平均头高"决定 → 取景尺度恒定,
+# 使模型无法再靠"画面大小/清晰度"这类捷径偷懒, 只能学两人的交互。
+PAIR_CROP_K = 5.0            # 边长 = K × 平均头高
+PAIR_CROP_DY = 0.18          # 中心下移 0.18×边长, 多纳入身体
+PAIR_PREP_SIZE = 256         # 裁剪区统一先缩放到该边长
+PAIR_INPUT_SIZE = 224        # JEPA 实际输入边长 (=256 中心裁 224)
 
 # ---- ② 视线夹角 (钝角 = 相互对看) ★主要调节点 ----
 GAZE_OBTUSE_THRESH = 100.0   # 夹角 ≥ 该值判为交头接耳 (慢慢试: 90~130)
@@ -129,7 +141,7 @@ JEPA_FRAMES = 16              # 采 16 帧 (与训练一致)
 JEPA_FRAME_STEP = 4           # 帧步长 4 → 16×4=64 帧 ≈ 3.2s 的时间窗
 JEPA_BUF_MAX = 64             # 帧缓冲上限(原始帧数), 存 720p 降采样
 JEPA_RERUN_INTERVAL = 60      # 同一配对每隔多少原始帧才重跑一次 JEPA (节流, 60≈3秒)
-JEPA_CROP_MARGIN = 0.25       # "两人区域"向外扩边比例 (给一点上下文/头动余量)
+                              # 裁剪规格见上面 PAIR_CROP_K / PAIR_CROP_DY / PAIR_PREP_SIZE
 
 # ---- 模型设置 (勿改) ----
 DEVICE = 'cuda:0'
@@ -165,7 +177,7 @@ def judge_pairs(heads, img_w):
             dy = abs(a['cy'] - b['cy'])
             if dy > ROW_Y_RATIO * ref_head:          # 不在同一排 (前后排)
                 continue
-            if dx > SEAT_DIST_RATIO * img_w:         # 距离太远, 不是邻座
+            if dx > NEAR_DX_RATIO * ref_head:        # 两人隔太远, 不是邻座
                 continue
             if dx < dy * NEIGHBOR_DX_RATIO:          # 偏前后而不是左右
                 continue
@@ -346,15 +358,54 @@ _JEPA_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 _JEPA_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
 
-def pair_region(body_a, body_b, img_w, img_h, margin=JEPA_CROP_MARGIN):
-    """两人区域的联合框(身体框取并集) + 向外扩边, 返回 (x1,y1,x2,y2) 全分辨率坐标。"""
-    x1 = min(body_a[0], body_b[0]); y1 = min(body_a[1], body_b[1])
-    x2 = max(body_a[2], body_b[2]); y2 = max(body_a[3], body_b[3])
-    w = x2 - x1; h = y2 - y1
-    mx = w * margin; my = h * margin
-    x1 = max(0, int(x1 - mx)); y1 = max(0, int(y1 - my))
-    x2 = min(img_w, int(x2 + mx)); y2 = min(img_h, int(y2 + my))
-    return x1, y1, x2, y2
+def pair_region(head_a, head_b, img_w, img_h):
+    """两人区域的固定规格正方形 —— 与采样脚本 sample_pairs.py 复用同一个函数。
+
+    边长 = PAIR_CROP_K × 平均头高, 以两头中心连线的中点为心, 再整体下移
+    PAIR_CROP_DY×边长(多纳入身体)。因为边长只取决于头高, 不同远近/不同机位
+    取出来的样本尺度完全一致, 模型没法再靠"画面大小/清晰度"走捷径。
+    返回 (x1,y1,x2,y2) 全分辨率坐标。
+    """
+    ax1, ay1, ax2, ay2 = head_a['bbox']
+    bx1, by1, bx2, by2 = head_b['bbox']
+    hh = ((ay2 - ay1) + (by2 - by1)) / 2.0
+    cx = (head_a['cx'] + head_b['cx']) / 2.0
+    cy = (head_a['cy'] + head_b['cy']) / 2.0
+    side = max(PAIR_CROP_K * hh, 40.0)
+    side = min(side, float(min(img_w, img_h)))          # 边长不超过画面短边
+    cy = cy + PAIR_CROP_DY * side
+    x1, y1 = cx - side / 2.0, cy - side / 2.0
+    x2, y2 = x1 + side, y1 + side
+    if x1 < 0:                                          # 平移到画面内(保持边长)
+        x2 -= x1; x1 = 0.0
+    if y1 < 0:
+        y2 -= y1; y1 = 0.0
+    if x2 > img_w:
+        x1 -= (x2 - img_w); x2 = float(img_w)
+    if y2 > img_h:
+        y1 -= (y2 - img_h); y2 = float(img_h)
+    x1 = max(0, x1); y1 = max(0, y1)
+    return int(x1), int(y1), int(x2), int(y2)
+
+
+def pair_prep(crop_bgr):
+    """裁剪区 → JEPA 输入 (float32, 已归一化)。与训练端预处理逐字对应:
+
+      短边缩放到 PAIR_PREP_SIZE(256) → 中心裁 PAIR_INPUT_SIZE(224)
+      → BGR→RGB → /255 → ImageNet mean/std
+    """
+    h, w = crop_bgr.shape[:2]
+    s = PAIR_PREP_SIZE / float(min(h, w))
+    if abs(s - 1.0) > 1e-6:
+        crop_bgr = cv2.resize(crop_bgr,
+                              (max(1, int(round(w * s))), max(1, int(round(h * s)))),
+                              interpolation=cv2.INTER_LINEAR)
+    h, w = crop_bgr.shape[:2]
+    y0 = max(0, (h - PAIR_INPUT_SIZE) // 2)
+    x0 = max(0, (w - PAIR_INPUT_SIZE) // 2)
+    c = crop_bgr[y0:y0 + PAIR_INPUT_SIZE, x0:x0 + PAIR_INPUT_SIZE]
+    x = c[..., ::-1].astype(np.float32) / 255.0          # BGR -> RGB
+    return (x - _JEPA_MEAN) / _JEPA_STD
 
 
 def jepa_predict_pair(encoder, classifier, buf, region, device):
@@ -369,10 +420,10 @@ def jepa_predict_pair(encoder, classifier, buf, region, device):
     crops = []
     for i in idx:
         c = buf[i][y1:y2, x1:x2]
-        crops.append(cv2.resize(c, (224, 224), interpolation=cv2.INTER_LINEAR))
-    x = np.stack(crops).astype(np.float32) / 255.0
-    x = x[..., ::-1]                                # BGR -> RGB
-    x = (x - _JEPA_MEAN) / _JEPA_STD
+        if c.size == 0 or min(c.shape[:2]) < 8:
+            return 0.0, 0
+        crops.append(pair_prep(c))
+    x = np.stack(crops)
     t = torch.from_numpy(x).permute(3, 0, 1, 2).unsqueeze(0).half().to(device)
     with torch.no_grad():
         feat = encoder(t)
@@ -562,7 +613,7 @@ if __name__ == '__main__':
                     c = jepa_cache.get(tid)
                     if c is None or (fi - c['fi']) >= JEPA_RERUN_INTERVAL:
                         a, b = heads[i], heads[j]
-                        r = pair_region(a['body'], b['body'], img_w, img_h)
+                        r = pair_region(a, b, img_w, img_h)
                         r720 = (int(r[0] * sx), int(r[1] * sy), int(r[2] * sx), int(r[3] * sy))
                         p_chat, _ = jepa_predict_pair(jepa_enc, jepa_clf, jepa_buf, r720, DEVICE)
                         jepa_cache[tid] = {'fi': fi, 'p_chat': p_chat}

@@ -3,12 +3,14 @@ r"""
 sample_pairs.py —— 为 JEPA 分类头重训采样"邻座两人配对"候选 clip
 
 设计要点(解决旧数据集的捷径问题):
-  1. 两类样本用**完全相同的裁剪规格**: 以两人头中心连线中点为心, 正方形边
-     side = max(2.2*两人头中心距, 7.0*平均头高), 再统一缩放到 OUT_SIZE。
-     -> 样本的取景尺度只由"人物自身大小"决定, 与画面来源无关
-  2. 一律保持同一个预处理链: OUT_SIZE -> 短边256 -> 中心裁224 -> 归一化
-     (与训练/推理共用, 见 common_prep)
-  3. 预标注: 座位约束通过 + 双方互相朝向 + 视线夹角 >= PRE1_GAZE 记 1(强可疑);
+  1. **配对**只取"真·邻座": 两人头距 ≤ NEAR_DX_RATIO(3.0) × 平均头高 (尺度无关)。
+     (旧版用 SEAT_DIST_RATIO=0.35×图宽, 在 4K 里 ≈ 13 倍头高, 会把隔 3~4 个座位
+      的人也算一对, 于是裁剪框大得能装下半个班, "这一对"根本无从辨认 —— 已废弃)
+  2. **裁剪规格**与 v1 推理端共用同一个函数 video.pair_region():
+     以两头中心连线中点为心, 正方形边长 = PAIR_CROP_K(5.0) × 平均头高, 再统一缩放到
+     PAIR_PREP_SIZE(256)。边长只跟头高有关 → 两类样本取景尺度完全一致。
+  3. **预处理链**也与推理端共用 video.pair_prep(): 256 → 中心裁 224 → 归一化。
+  4. 预标注: 座位约束通过 + 双方互相朝向 + 视线夹角 >= PRE1_GAZE 记 1(强可疑);
      互相朝向且夹角 >= PRE2_GAZE 记 2(待定); 其余记 0(正常)
      -> 人工只需快速过一遍修正
 
@@ -51,13 +53,13 @@ SRC_DIRS = [
 ]
 OUT_DIR = r"D:\chatting\_dataset"
 IMGSZ_DET = 1920             # 检测分辨率(调高, 远景小头也能检出)
-SAMPLE_INTERVAL = 3.0        # 每隔多少秒检一次
+SAMPLE_INTERVAL = 2.0        # 每隔多少秒检一次 (调小 → 稀缺的"互相朝向"样本收得更多, 但更慢)
 CLIP_DUR = 3.0               # 每个候选 clip 的时长(秒)
-OUT_SIZE = 256               # 裁剪区统一缩放到的边长(与预处理一致)
-MAX_PER_VIDEO = 90           # 每个源视频最多导出多少 clip
+OUT_SIZE = V.PAIR_PREP_SIZE  # 裁剪区统一缩放到的边长(与训练/推理预处理一致)
+MAX_PER_VIDEO = 60           # 每个源视频最多导出多少 clip(全局按可疑度排序后取前 N)
 PRE1_GAZE = 100.0            # 预标 1 的视线夹角阈值(与 v1 一致)
 PRE2_GAZE = 70.0             # 预标 2 的阈值
-MAX_PER_CLASS = 400          # 每类上限(全局, 防止某一类爆量)
+MAX_PER_CLASS = 1200         # 每类上限(全局); 设很大 = 基本不截断, 保留自然分布
 
 DEVICE = V.DEVICE
 IMGSZ = V.IMGSZ
@@ -196,7 +198,7 @@ def seat_pairs(heads, img_w):
             dy = abs(a["cy"] - b["cy"])
             if dy > V.ROW_Y_RATIO * ref_head:
                 continue
-            if dx > V.SEAT_DIST_RATIO * img_w:
+            if dx > V.NEAR_DX_RATIO * ref_head:     # ★真·邻座: 头距 ≤ 3 倍平均头高
                 continue
             if dx < dy * V.NEIGHBOR_DX_RATIO:
                 continue
@@ -224,27 +226,9 @@ def prelabel(gaze, toward):
 
 
 # ==============================================================================
-# 固定规格裁剪框
+# 固定规格裁剪框 —— 直接用 video.py 的 pair_region, 保证训练/推理几何完全一致
 # ==============================================================================
-def make_box(a, b, img_w, img_h):
-    cx = (a["cx"] + b["cx"]) / 2.0
-    cy = (a["cy"] + b["cy"]) / 2.0
-    hh = ((a["bbox"][3] - a["bbox"][1]) + (b["bbox"][3] - b["bbox"][1])) / 2.0
-    d = math.hypot(a["cx"] - b["cx"], a["cy"] - b["cy"])
-    side = max(2.2 * d, 7.0 * hh, 40.0)
-    cy = cy + 0.18 * side                      # 稍微下移, 多纳入身体
-    x1, y1 = cx - side / 2.0, cy - side / 2.0
-    x2, y2 = x1 + side, y1 + side
-    if x1 < 0:                                  # 平移回画面内(保持边长)
-        x2 -= x1; x1 = 0.0
-    if y1 < 0:
-        y2 -= y1; y1 = 0.0
-    if x2 > img_w:
-        x1 -= (x2 - img_w); x2 = float(img_w)
-    if y2 > img_h:
-        y1 -= (y2 - img_h); y2 = float(img_h)
-    x1 = max(0, x1); y1 = max(0, y1)
-    return int(x1), int(y1), int(x2), int(y2)
+make_box = V.pair_region
 
 
 # ==============================================================================
@@ -377,7 +361,8 @@ def dump_csv(rows, out_dir):
     with open(p, "w", newline="", encoding="utf-8-sig") as fh:
         wr = csv.DictWriter(fh, fieldnames=["clip", "src", "frame", "sec", "pre",
                                             "gaze", "toward", "dist", "head_h",
-                                            "x1", "y1", "x2", "y2"])
+                                            "x1", "y1", "x2", "y2",
+                                            "ax", "ay", "bx", "by"])
         wr.writeheader()
         wr.writerows(rows)
     return p
@@ -448,58 +433,80 @@ def main():
         step = max(1, int(round(args.interval * fps)))
         clip_len = max(1, int(round(CLIP_DUR * fps)))
         made = 0
-        recent = []                          # [(fi, cx, cy)] 相邻采样点去重
         print(f"\n[{vi}/{len(videos)}] {stem}  {fps:.0f}fps {nframes}帧 "
               f"每{step}帧检一次 imgsz={args.imgsz}")
 
+        # ---- 第一遍: 只做检测, 把整段视频的"真·邻座"配对全部收下来 ----
+        # 不能边跑边占配额: 早期帧的"正常"样本会把配额吃光, 漏掉后面才出现的强可疑。
+        cands = []
         for fi in range(0, max(1, nframes - clip_len), step):
-            if made >= args.max_per_video:
-                break
             cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
             ok, im0 = cap.read()
             if not ok:
                 continue
+            img_h, img_w = im0.shape[:2]
             img = letterbox(im0, args.imgsz, stride=STRIDE, auto=True)[0]
             img = np.ascontiguousarray(img.transpose((2, 0, 1))[::-1])
-            img_h, img_w = im0.shape[:2]
             heads = detect_heads(img, im0, agent, det_model)
             if len(heads) < 2:
                 continue
-            # 优先采"强可疑"(正样本稀缺), 其次待定, 最后正常; 每时刻最多 2 对
-            cand = list(seat_pairs(heads, img_w))
-            cand.sort(key=lambda x: (0 if prelabel(x[2], x[3]) == 1
-                                     else (1 if prelabel(x[2], x[3]) == 2 else 2), -x[2]))
-            for (i, j, gaze, toward) in cand[:2]:
-                if made >= args.max_per_video:
-                    break
-                pre = prelabel(gaze, toward)
-                cap_cls = MAX_PER_CLASS if pre != 2 else max(60, MAX_PER_CLASS // 3)
-                if counts[pre] >= cap_cls:
-                    continue
+            for (i, j, gaze, toward) in seat_pairs(heads, img_w):
                 a, b = heads[i], heads[j]
-                mcx, mcy = (a["cx"] + b["cx"]) / 2.0, (a["cy"] + b["cy"]) / 2.0
                 hh = ((a["bbox"][3] - a["bbox"][1]) + (b["bbox"][3] - b["bbox"][1])) / 2.0
-                if any(abs(fi - pf) < step * 1.5
-                       and math.hypot(mcx - px, mcy - py) < 1.5 * hh
-                       for pf, px, py in recent):
-                    continue                     # 同一对刚采过, 跳过
-                box = make_box(a, b, img_w, img_h)
-                seq += 1
-                cid = f"{stem}_f{fi:05d}_{seq:04d}"
-                cpath = os.path.join(clips_dir, cid + ".mp4")
-                if os.path.exists(cpath) or write_clip(cap, fi, box, fps, cpath) == 0:
-                    continue
-                d = math.hypot(a["cx"] - b["cx"], a["cy"] - b["cy"])
-                rows.append({
-                    "clip": os.path.relpath(cpath, args.out), "src": vpath,
-                    "frame": fi, "sec": round(fi / fps, 2), "pre": pre,
-                    "gaze": round(gaze, 1), "toward": int(toward),
-                    "dist": round(d, 1), "head_h": round(hh, 1),
-                    "x1": box[0], "y1": box[1], "x2": box[2], "y2": box[3],
+                cands.append({
+                    "fi": fi, "gaze": gaze, "toward": toward, "hh": hh, "a": a, "b": b,
+                    "pre": prelabel(gaze, toward),
+                    "mcx": (a["cx"] + b["cx"]) / 2.0, "mcy": (a["cy"] + b["cy"]) / 2.0,
                 })
-                recent.append((fi, mcx, mcy))
-                counts[pre] += 1
-                made += 1
+        # ---- 全局排序: 先"双方都朝对方看"的, 再按夹角从大到小; 再按 2:1 交替 ----
+        # 两类都要有: "互相朝向"的是部署时第一段真正会抓的分布(难样本集中在这里),
+        # 其余的高夹角配对提供普通负样本, 也覆盖不同夹角区间, 免得模型只认一个角度。
+        cands.sort(key=lambda c: (0 if c["toward"] else 1, -c["gaze"]))
+        tow = [c for c in cands if c["toward"]]
+        oth = [c for c in cands if not c["toward"]]
+        cands, i1, i2 = [], 0, 0
+        while i1 < len(tow) or i2 < len(oth):
+            for _ in range(2):
+                if i1 < len(tow):
+                    cands.append(tow[i1]); i1 += 1
+            if i2 < len(oth):
+                cands.append(oth[i2]); i2 += 1
+        print(f"    真·邻座配对 {len(tow) + len(oth)} 个(互相朝向 {len(tow)}) "
+              f"→ 按可疑度取前 {args.max_per_video} 个")
+
+        # ---- 第二遍: 回放取 clip (write_clip 自己 seek, 与循环位置无关) ----
+        recent = []                          # [(fi, cx, cy)] 相邻采样点去重
+        for c in cands:
+            if made >= args.max_per_video:
+                break
+            pre = c["pre"]
+            if counts[pre] >= MAX_PER_CLASS:
+                continue
+            fi, hh = c["fi"], c["hh"]
+            if any(abs(fi - pf) < step * 1.5
+                   and math.hypot(c["mcx"] - px, c["mcy"] - py) < 1.5 * hh
+                   for pf, px, py in recent):
+                continue                     # 同一对刚采过, 跳过
+            a, b = c["a"], c["b"]
+            box = make_box(a, b, img_w, img_h)
+            seq += 1
+            cid = f"{stem}_f{fi:05d}_{seq:04d}"
+            cpath = os.path.join(clips_dir, cid + ".mp4")
+            if os.path.exists(cpath) or write_clip(cap, fi, box, fps, cpath) == 0:
+                continue
+            d = math.hypot(a["cx"] - b["cx"], a["cy"] - b["cy"])
+            rows.append({
+                "clip": os.path.relpath(cpath, args.out), "src": vpath,
+                "frame": fi, "sec": round(fi / fps, 2), "pre": pre,
+                "gaze": round(c["gaze"], 1), "toward": int(c["toward"]),
+                "dist": round(d, 1), "head_h": round(hh, 1),
+                "x1": box[0], "y1": box[1], "x2": box[2], "y2": box[3],
+                "ax": round(a["cx"], 1), "ay": round(a["cy"], 1),
+                "bx": round(b["cx"], 1), "by": round(b["cy"], 1),
+            })
+            recent.append((fi, c["mcx"], c["mcy"]))
+            counts[pre] += 1
+            made += 1
         cap.release()
         print(f"    导出 {made} 个; 累计 正常{counts[0]} / 强可疑{counts[1]} / 待定{counts[2]}")
         dump_csv(rows, args.out)        # 每处理完一个视频就落盘, 方便边采边标

@@ -391,22 +391,51 @@ def main():
     ap.add_argument("--max-per-video", type=int, default=MAX_PER_VIDEO)
     ap.add_argument("--limit", type=int, default=0, help="只处理前 N 个源视频(0=全部)")
     ap.add_argument("--imgsz", type=int, default=IMGSZ_DET, help="检测分辨率")
+    ap.add_argument("--resume", action="store_true",
+                    help="续采: 读已有 candidates.csv, 跳过已处理过的源视频")
+    ap.add_argument("--only", default="", help="只处理路径含该子串的源视频")
     args = ap.parse_args()
 
     dirs = [d.strip() for d in args.dirs.split(";") if d.strip()]
     clips_dir = os.path.join(args.out, "clips")
     os.makedirs(clips_dir, exist_ok=True)
     videos = list_videos(dirs)
+    if args.only:
+        videos = [v for v in videos if args.only in v]
     if args.limit:
         videos = videos[:args.limit]
-    print(f"[输入] {len(videos)} 个源视频\n[输出] {clips_dir}")
+
+    # ---- 续采: 恢复已有候选清单, 跳过已处理源视频 ----
+    rows, counts, seq = [], {0: 0, 1: 0, 2: 0}, 0
+    done_srcs = set()
+    csv_path = os.path.join(args.out, "candidates.csv")
+    if args.resume and os.path.exists(csv_path):
+        with open(csv_path, encoding="utf-8-sig") as fh:
+            rows = list(csv.DictReader(fh))
+        for r in rows:
+            src = (r.get("src") or "").strip()
+            if src:
+                done_srcs.add(os.path.normcase(os.path.abspath(src)))
+            try:
+                counts[int(r.get("pre") or 0)] += 1
+            except (TypeError, ValueError):
+                pass
+        for r in rows:                       # seq 接着最大值往后排, 避免重名覆盖
+            try:
+                seq = max(seq, int(str(r["clip"]).rsplit("_", 1)[-1].split(".")[0]))
+            except (KeyError, ValueError, IndexError):
+                pass
+    print(f"[输入] {len(videos)} 个源视频 (已采过 {len(done_srcs)})")
+    print(f"[输出] {clips_dir}")
+    if done_srcs:
+        print(f"[续采] 已有 {len(rows)} 条候选, seq 从 {seq} 继续")
 
     agent, det_model = load_models(args.imgsz)
 
-    rows = []
-    counts = {0: 0, 1: 0, 2: 0}
-    seq = 0
     for vi, vpath in enumerate(videos, 1):
+        if os.path.normcase(os.path.abspath(vpath)) in done_srcs:
+            print(f"[{vi}/{len(videos)}] [跳过] 已采过: {os.path.basename(vpath)}")
+            continue
         stem = os.path.splitext(os.path.basename(vpath))[0]
         cap = cv2.VideoCapture(vpath)
         if not cap.isOpened():

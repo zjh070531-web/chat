@@ -99,6 +99,14 @@ const $ = id => document.getElementById(id);
 const preText = p => p === '1' ? '强可疑' : (p === '2' ? '待定' : '正常');
 const preCls  = p => p === '1' ? 't1' : (p === '2' ? 't2' : 't0');
 
+$('v').addEventListener('error', () => {
+  const e = $('v').error;
+  const m = {1: '加载被中断', 2: '网络/解码错误', 3: '解码失败', 4: '格式不支持'};
+  $('s-cur').innerHTML = '<b style="color:var(--chat)">⚠ 视频无法播放'
+      + (e && m[e.code] ? '（' + m[e.code] + '）' : '')
+      + ' —— 编码需为 H.264</b>';
+});
+
 async function boot() {
   const r = await fetch('/api/data');
   const d = await r.json();

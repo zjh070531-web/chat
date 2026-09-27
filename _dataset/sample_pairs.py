@@ -21,6 +21,7 @@ import argparse
 import csv
 import math
 import os
+import subprocess
 import sys
 
 os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "-8")   # 压掉 HEVC 长GOP 的刷屏警告
@@ -246,25 +247,107 @@ def make_box(a, b, img_w, img_h):
     return int(x1), int(y1), int(x2), int(y2)
 
 
+# ==============================================================================
+# H.264 编码 —— 浏览器 <video> 只认 H.264(yuv420p), 不认 OpenCV 默认的 mp4v(FMP4)
+# ==============================================================================
+FFMPEG_HINTS = [
+    r"D:\ffmpeg\ffmpeg-2026-09-07-git-ecc7eb519e-essentials_build\bin\ffmpeg.EXE",
+    r"D:\ffmpeg\bin\ffmpeg.exe",
+    "ffmpeg",
+]
+FFMPEG = None
+_FFMPEG_TRIED = False
+
+
+def find_ffmpeg():
+    """找到一个带 libx264 的 ffmpeg; 找不到返回 None"""
+    import shutil
+    ck = set()
+    cands = list(FFMPEG_HINTS)
+    try:
+        import imageio_ffmpeg
+        cands.append(imageio_ffmpeg.get_ffmpeg_exe())
+    except Exception:
+        pass
+    for c in cands:
+        if not c or c in ck:
+            continue
+        ck.add(c)
+        p = c if os.path.isfile(c) else shutil.which(c)
+        if not p:
+            continue
+        try:
+            r = subprocess.run([p, "-hide_banner", "-encoders"],
+                               capture_output=True, text=True, errors="replace", timeout=30)
+            if "libx264" in (r.stdout or ""):
+                return p
+        except Exception:
+            continue
+    return None
+
+
+def encode_h264(frames, out_path, size, fps, crf=20):
+    """把 BGR 帧序列编成 H.264 mp4; 返回写入帧数(全失败返回 0)"""
+    global FFMPEG, _FFMPEG_TRIED
+    if not frames:
+        return 0
+    if not _FFMPEG_TRIED:
+        FFMPEG = find_ffmpeg()
+        _FFMPEG_TRIED = True
+    if FFMPEG:
+        cmd = [FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
+               "-f", "rawvideo", "-pix_fmt", "bgr24",
+               "-s", "%dx%d" % (size, size), "-r", "%.6f" % float(fps), "-i", "-",
+               "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf),
+               "-pix_fmt", "yuv420p", "-movflags", "+faststart", out_path]
+        try:
+            p = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            for f in frames:
+                p.stdin.write(np.ascontiguousarray(f).tobytes())
+            p.stdin.close()
+            p.wait(timeout=180)
+            if p.returncode == 0 and os.path.getsize(out_path) > 0:
+                return len(frames)
+            err = (p.stderr.read() or b"").decode("utf-8", "replace")[:200]
+            print("  [warn] ffmpeg 退出码 %s: %s" % (p.returncode, err))
+        except Exception as e:
+            print("  [warn] ffmpeg 编码异常:", e)
+    # 兜底: OpenCV avc1(openh264) → mp4v(不可播, 仅保证有文件)
+    for tag in ("avc1", "mp4v"):
+        try:
+            w = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*tag), fps, (size, size))
+            if not w.isOpened():
+                continue
+            for f in frames:
+                w.write(f)
+            w.release()
+            if os.path.getsize(out_path) > 0:
+                if tag == "mp4v":
+                    print("  [warn] 无 ffmpeg, 回落 mp4v(浏览器播不了):", os.path.basename(out_path))
+                return len(frames)
+        except Exception:
+            continue
+    return 0
+
+
 def write_clip(cap, start_frame, box, fps, out_path, size=OUT_SIZE):
-    """从 start_frame 起连续读 CLIP_DUR 秒, 用固定 box 裁剪并缩放写出"""
+    """从 start_frame 起连续读 CLIP_DUR 秒, 用固定 box 裁剪并缩放写出(H.264)"""
     x1, y1, x2, y2 = box
     if x2 - x1 < 8 or y2 - y1 < 8:
         return 0
     cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
     need = max(1, int(round(CLIP_DUR * fps)))
-    w = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (size, size))
-    if not w.isOpened():
-        return 0
-    got = 0
+    frames = []
     for _ in range(need):
         ok, f = cap.read()
         if not ok:
             break
-        w.write(cv2.resize(f[y1:y2, x1:x2], (size, size), interpolation=cv2.INTER_AREA))
-        got += 1
-    w.release()
-    if got < need * 0.6:                        # 帧数明显不足 → 丢弃
+        frames.append(cv2.resize(f[y1:y2, x1:x2], (size, size), interpolation=cv2.INTER_AREA))
+    if len(frames) < need * 0.6:                # 帧数明显不足 → 丢弃
+        return 0
+    got = encode_h264(frames, out_path, size, fps)
+    if got < need * 0.6:
         try:
             os.remove(out_path)
         except OSError:

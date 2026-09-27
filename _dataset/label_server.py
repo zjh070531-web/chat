@@ -51,9 +51,65 @@ def save_labels(d):
             w.writerow([k, d[k]])
 
 
+MEDIA_EXT = (".mp4", ".webm", ".m4v")
+
+
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *a, **kw):
         super().__init__(*a, directory=ROOT, **kw)
+
+    def guess_type(self, path):
+        # Windows 注册表里的 .mp4 映射不可靠, 显式钉死成 video/mp4
+        if os.path.splitext(str(path))[1].lower() in MEDIA_EXT:
+            return "video/mp4"
+        return super().guess_type(path)
+
+    def _serve_media(self, path):
+        """带 Range + no-store 的视频下发(浏览器 seek/循环播放需要)"""
+        try:
+            f = open(path, "rb")
+        except OSError:
+            self.send_error(404, "File not found")
+            return
+        with f:
+            size = os.fstat(f.fileno()).st_size
+            start, end, code = 0, size - 1, 200
+            rng = self.headers.get("Range") or ""
+            if rng.startswith("bytes="):
+                try:
+                    spec = rng.split("=", 1)[1].split(",")[0].strip()
+                    a, _, b = spec.partition("-")
+                    if a == "":
+                        start = max(0, size - int(b))
+                    else:
+                        start = int(a)
+                        if b:
+                            end = min(int(b), size - 1)
+                    if start > end or start >= size:
+                        raise ValueError(spec)
+                    code = 206
+                except Exception:
+                    start, end, code = 0, size - 1, 200
+            n = end - start + 1
+            self.send_response(code)
+            self.send_header("Content-Type", "video/mp4")
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Length", str(n))
+            self.send_header("Cache-Control", "no-store, must-revalidate")
+            if code == 206:
+                self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, size))
+            self.end_headers()
+            f.seek(start)
+            left = n
+            while left > 0:
+                chunk = f.read(min(65536, left))
+                if not chunk:
+                    break
+                try:
+                    self.wfile.write(chunk)
+                except (BrokenPipeError, ConnectionResetError):
+                    return
+                left -= len(chunk)
 
     def _json(self, obj, code=200):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -70,6 +126,10 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if self.path == "/":
             self.path = "/label.html"
+        path = self.translate_path(self.path)
+        if os.path.isfile(path) and path.lower().endswith(MEDIA_EXT):
+            self._serve_media(path)
+            return
         return super().do_GET()
 
     def do_POST(self):

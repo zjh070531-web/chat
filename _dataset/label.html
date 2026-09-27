@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>交头接耳样本标注</title>
+<style>
+  :root{
+    --bg:#f6f7f9; --panel:#ffffff; --line:#e3e6ea; --txt:#1f2328; --dim:#6b7280;
+    --chat:#d92b2b; --ok:#1a7f37; --todo:#c2410c; --accent:#2563eb;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);
+       font:14px/1.5 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+  header{padding:14px 20px 10px;background:var(--panel);border-bottom:1px solid var(--line);
+         position:sticky;top:0;z-index:5}
+  .bar{height:6px;background:#e9edf2;border-radius:3px;overflow:hidden;margin-bottom:8px}
+  .bar>i{display:block;height:100%;background:var(--accent);width:0;transition:width .2s}
+  .stats{display:flex;gap:22px;flex-wrap:wrap;font-size:13px;color:var(--dim)}
+  .stats b{color:var(--txt)}
+  main{display:flex;gap:24px;padding:24px;align-items:flex-start;flex-wrap:wrap}
+  .stage{background:#111;border-radius:10px;padding:12px;box-shadow:0 2px 14px rgba(0,0,0,.10)}
+  video{display:block;width:460px;height:460px;image-rendering:pixelated;background:#000;
+        border-radius:6px}
+  aside{flex:1;min-width:300px;max-width:520px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+        padding:16px 18px;margin-bottom:14px}
+  .card h3{margin:0 0 10px;font-size:13px;color:var(--dim);font-weight:600;letter-spacing:.4px}
+  .row{display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px dashed #eef1f4}
+  .row:last-child{border-bottom:0}
+  .row span:first-child{color:var(--dim)}
+  .tag{display:inline-block;padding:2px 9px;border-radius:20px;font-size:12px;font-weight:600}
+  .t1{background:#fdeaea;color:var(--chat)}
+  .t0{background:#eaf5ec;color:var(--ok)}
+  .t2{background:#fdf1e6;color:var(--todo)}
+  .tlab{background:#e8effd;color:var(--accent)}
+  .keys{display:grid;grid-template-columns:auto 1fr;gap:8px 14px;font-size:13px}
+  kbd{background:#f1f3f6;border:1px solid #d7dbe0;border-bottom-width:2px;border-radius:5px;
+      padding:2px 8px;font:600 12px/1.4 ui-monospace,Consolas,monospace}
+  .btn{display:inline-block;padding:9px 18px;border-radius:8px;border:0;cursor:pointer;
+       font-size:14px;font-weight:600;color:#fff;margin-right:8px}
+  .b1{background:var(--chat)} .b0{background:var(--ok)} .bs{background:#8b93a1}
+  .done{color:var(--ok);font-weight:600}
+  .empty{padding:60px;text-align:center;color:var(--dim)}
+</style>
+</head>
+<body>
+<header>
+  <div class="bar"><i id="fill"></i></div>
+  <div class="stats">
+    <div>进度 <b id="s-prog">0 / 0</b></div>
+    <div>交头接耳 <b id="s-1" style="color:var(--chat)">0</b></div>
+    <div>正常 <b id="s-0" style="color:var(--ok)">0</b></div>
+    <div>未标 <b id="s-todo">0</b></div>
+    <div id="s-cur"></div>
+  </div>
+</header>
+<main id="main">
+  <div class="stage"><video id="v" autoplay loop muted playsinline></video></div>
+  <aside>
+    <div class="card">
+      <h3>当前样本</h3>
+      <div class="row"><span>编号</span><b id="m-idx">-</b></div>
+      <div class="row"><span>文件</span><b id="m-clip" style="font-size:12px">-</b></div>
+      <div class="row"><span>来源机位 / 时间</span><b id="m-src" style="font-size:12px">-</b></div>
+      <div class="row"><span>预标注(参考)</span><b id="m-pre">-</b></div>
+      <div class="row"><span>视线夹角 / 互相朝向</span><b id="m-gaze">-</b></div>
+      <div class="row"><span>两人头距 / 头高(px)</span><b id="m-dist">-</b></div>
+      <div class="row"><span>当前标注</span><b id="m-lab">未标</b></div>
+    </div>
+    <div class="card">
+      <h3>判断标准</h3>
+      <div style="color:var(--dim);font-size:13px">
+        这两人是否正在<b>交谈/说话</b>(交头接耳)? 只看两人的动作与交互 ——
+        嘴部张合、身体前倾凑近、持续互动。仅仅是<b>互相看</b>不算。
+      </div>
+    </div>
+    <div class="card">
+      <h3>快捷键</h3>
+      <div class="keys">
+        <kbd>1</kbd><span>标记为「交头接耳」并跳到下一条</span>
+        <kbd>0</kbd><span>标记为「正常」并跳到下一条</span>
+        <kbd>空格</kbd><span>重播当前样本</span>
+        <kbd>← / →</kbd><span>上一条 / 下一条</span>
+        <kbd>Backspace</kbd><span>清除当前标注</span>
+      </div>
+    </div>
+    <div class="card">
+      <button class="btn b1" onclick="mark(1)">交头接耳 (1)</button>
+      <button class="btn b0" onclick="mark(0)">正常 (0)</button>
+      <button class="btn bs" onclick="next()">跳过</button>
+    </div>
+  </aside>
+</main>
+
+<script>
+let rows = [], labels = {}, dirty = {}, i = 0, timer = null;
+
+const $ = id => document.getElementById(id);
+const preText = p => p === '1' ? '强可疑' : (p === '2' ? '待定' : '正常');
+const preCls  = p => p === '1' ? 't1' : (p === '2' ? 't2' : 't0');
+
+async function boot() {
+  const r = await fetch('/api/data');
+  const d = await r.json();
+  rows = d.rows || []; labels = d.labels || {};
+  if (!rows.length) {
+    $('main').innerHTML = '<div class="empty">candidates.csv 里没有候选样本</div>';
+    return;
+  }
+  const first = rows.findIndex(x => !(x.clip in labels));
+  i = first < 0 ? 0 : first;
+  render();
+}
+
+function render() {
+  if (!rows.length) return;
+  const r = rows[i];
+  $('v').src = '/' + String(r.clip).replace(/\\/g, '/').replace(/^\/+/, '');
+  $('v').load();
+  $('v').play().catch(() => {});
+  $('m-idx').textContent = (i + 1) + ' / ' + rows.length;
+  $('m-clip').textContent = String(r.clip).split(/[\\\/]/).pop();
+  $('m-src').textContent = String(r.src).split(/[\\\/]/).slice(-1)[0] + ' @ ' + r.sec + 's';
+  $('m-pre').innerHTML = '<span class="tag ' + preCls(r.pre) + '">' + preText(r.pre) + '</span>';
+  $('m-gaze').textContent = r.gaze + '°  /  ' + (r.toward === '1' ? '是' : '否');
+  $('m-dist').textContent = r.dist + ' / ' + r.head_h;
+  const l = labels[r.clip];
+  $('m-lab').innerHTML = l === undefined
+      ? '未标' : '<span class="tag ' + (l ? 't1' : 't0') + '">' + (l ? '交头接耳' : '正常') + '</span>';
+  $('s-cur').textContent = '当前: ' + String(r.clip).split(/[\\\/]/).pop();
+  let n1 = 0, n0 = 0;
+  for (const k in labels) { labels[k] ? n1++ : n0++; }
+  const done = n1 + n0;
+  $('s-1').textContent = n1;
+  $('s-0').textContent = n0;
+  $('s-todo').textContent = rows.length - done;
+  $('s-prog').textContent = done + ' / ' + rows.length;
+  $('fill').style.width = (100 * done / rows.length).toFixed(1) + '%';
+}
+
+function flush() {
+  clearTimeout(timer);
+  timer = setTimeout(async () => {
+    const body = JSON.stringify(dirty); dirty = {};
+    try { await fetch('/api/label', { method: 'POST', body }); } catch (e) {}
+  }, 250);
+}
+
+function mark(v) {
+  labels[rows[i].clip] = v; dirty[rows[i].clip] = v; flush(); next();
+}
+function next() { i = Math.min(i + 1, rows.length - 1); render(); }
+function prev() { i = Math.max(i - 1, 0); render(); }
+
+document.addEventListener('keydown', e => {
+  if (e.key === '1') { e.preventDefault(); mark(1); }
+  else if (e.key === '0') { e.preventDefault(); mark(0); }
+  else if (e.key === ' ') { e.preventDefault(); const v = $('v'); v.currentTime = 0; v.play(); }
+  else if (e.key === 'ArrowRight') { e.preventDefault(); next(); }
+  else if (e.key === 'ArrowLeft') { e.preventDefault(); prev(); }
+  else if (e.key === 'Backspace') {
+    e.preventDefault();
+    delete labels[rows[i].clip]; dirty[rows[i].clip] = null; flush(); render();
+  }
+});
+
+boot();
+</script>
+</body>
+</html>

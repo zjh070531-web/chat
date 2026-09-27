@@ -89,7 +89,7 @@ def post_process_batch(imgs, paths, shapes, body_dets, part_dets, num_offsets, m
 # 【参数】★ 需要调节的都在这
 # ==============================================================================
 VIDEO_DIR = r"D:\video\1\1\right\cutting_video2"   # 输入视频目录
-OUTPUT_DIR = r"D:\chatting\outputs"                # 输出目录
+OUTPUT_DIR = r"D:\chatting\outputs(2)"                # 输出目录
 FRAME_SKIP = 3                                      # 每3帧处理1帧 (提速; 输出视频时长不变)
 
 # ---- 检测 (防椅子靠背被当成人头) ----

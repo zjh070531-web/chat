@@ -19,6 +19,7 @@ import os
 import sys
 import glob
 import math
+from collections import deque
 
 import cv2
 import numpy as np
@@ -116,6 +117,20 @@ SMOOTH_CONFIRM_FRAMES = 2     # 连续命中几帧才确认 (FRAME_SKIP=3 + 25fp
 SMOOTH_HOLD_FRAMES = 2        # 确认后容忍连续漏检几帧 (防闪烁/缓解漏检)
 SMOOTH_MATCH_DIST = 0.8       # 跨帧"同一个配对"的匹配上限 (×平均头高); 调太大易串配对
 
+# ---- ②第二阶段: JEPA 二次确认 (视线夹角抓可疑 → JEPA 判"是否真在说话") ----
+# 思路: 第一段(视线夹角)只负责"抓可疑配对", 第二段用你训练的 V-JEPA 二分类模型
+#       (chatting/not_chatting) 裁剪"两人区域"的 16 帧 clip 再判一次, 过阈值才算确认。
+JEPA_ENABLE = True            # 关掉 = 退回只靠视线夹角的旧版
+JEPA_ROOT = r"D:\jepa-main"   # V-JEPA 代码根目录 (src/ 在这里)
+JEPA_BACKBONE = r"D:\jepa-main\pretrained_weights\vitl16.pth.tar"          # 冻结主干
+JEPA_HEAD = r"D:\jepa-main\pretrained_weights\video_classification_frozen\ssv2-16x2x3\jepa-best.pth.tar"  # 分类头(best)
+JEPA_CONFIRM_THRESH = 0.5     # P(交头接耳) ≥ 该值才最终确认 (0.5=取argmax; 调高更严)
+JEPA_FRAMES = 16              # 采 16 帧 (与训练一致)
+JEPA_FRAME_STEP = 4           # 帧步长 4 → 16×4=64 帧 ≈ 3.2s 的时间窗
+JEPA_BUF_MAX = 64             # 帧缓冲上限(原始帧数), 存 720p 降采样
+JEPA_RERUN_INTERVAL = 60      # 同一配对每隔多少原始帧才重跑一次 JEPA (节流, 60≈3秒)
+JEPA_CROP_MARGIN = 0.25       # "两人区域"向外扩边比例 (给一点上下文/头动余量)
+
 # ---- 模型设置 (勿改) ----
 DEVICE = 'cuda:0'
 IMGSZ = 960
@@ -202,6 +217,7 @@ class PairSmoother:
         self.hold_max = max(0, int(hold_frames))
         self.ratio = float(match_dist_ratio)
         self.tracks = []
+        self._next_id = 0
 
     def _dist(self, t, ha, hb):
         """配对距离 = 两头中心距离的平均; 允许 a/b 顺序互换"""
@@ -233,11 +249,13 @@ class PairSmoother:
                     best, best_d = ti, d
 
             if best < 0:                                  # 没见过 → 新建
+                tid = self._next_id
+                self._next_id += 1
                 self.tracks.append({'a': (ha['cx'], ha['cy']), 'b': (hb['cx'], hb['cy']),
-                                    'consec': 1, 'hold': 0})
+                                    'consec': 1, 'hold': 0, 'id': tid})
                 claimed.add(len(self.tracks) - 1)
                 if self.confirm <= 1:                     # 阈值=1 时首帧即确认
-                    confirmed.append((i, j, gaze))
+                    confirmed.append((i, j, gaze, tid))
             else:                                         # 命中 → 累加
                 claimed.add(best)
                 t = self.tracks[best]
@@ -246,7 +264,7 @@ class PairSmoother:
                 t['consec'] += 1
                 t['hold'] = self.hold_max
                 if t['consec'] >= self.confirm:
-                    confirmed.append((i, j, gaze))
+                    confirmed.append((i, j, gaze, t['id']))
 
         # 本轮没出现的配对: 消耗 hold, 同时 consec 衰减; hold 用完则删除
         alive = []
@@ -260,6 +278,107 @@ class PairSmoother:
                 alive.append(t)
         self.tracks = alive
         return confirmed
+
+
+# ==============================================================================
+# ②第二阶段 JEPA: V-JEPA 冻结主干 + AttentiveClassifier 二分类 (chatting/not_chatting)
+#    输入 16 帧"两人区域"裁剪 → 输出 P(交头接耳)
+# ==============================================================================
+def _load_jepa_classes():
+    """在 yolo 环境导入 JEPA 的 vit_large / AttentiveClassifier。
+
+    坑: SemiUHPE 与 JEPA 都把顶层包叫 `src`, 且两边 `src` 都是无 __init__.py 的
+    namespace 包 —— 只要两个根目录同时在 sys.path, Python 就会把两者合并成一个
+    namespace 包, 导致 JEPA 的 `src.utils/`(目录) 被 SemiUHPE 的 `src/utils.py`(文件)
+    顶掉, 报 "src.utils is not a package"。所以这里必须把 SemiUHPE 根目录临时移出
+    sys.path, 再导入 JEPA, 导入完恢复。
+    """
+    saved_modules = {k: sys.modules.pop(k) for k in list(sys.modules)
+                     if k == 'src' or k.startswith('src.')}
+    saved_path = sys.path[:]
+    py_root_abs = os.path.abspath(PY_ROOT)
+    sys.path = [JEPA_ROOT] + [p for p in saved_path
+                              if p and os.path.abspath(p) != py_root_abs]
+    try:
+        import src.models.vision_transformer as _vit
+        import src.models.attentive_pooler as _ap
+        return _vit.vit_large, _ap.AttentiveClassifier
+    finally:
+        sys.path[:] = saved_path
+        for k in list(sys.modules):
+            if k == 'src' or k.startswith('src.'):
+                del sys.modules[k]
+        sys.modules.update(saved_modules)
+
+
+def load_jepa():
+    """构建并加载 JEPA 模型 (fp16), 返回 (encoder, classifier); 失败返回 (None, None)。"""
+    try:
+        vit_large, AttentiveClassifier = _load_jepa_classes()
+
+        encoder = vit_large(patch_size=16, tubelet_size=2, img_size=224,
+                            num_frames=JEPA_FRAMES, uniform_power=True)
+        main_ckpt = torch.load(JEPA_BACKBONE, map_location='cpu', weights_only=False)
+        sd = main_ckpt['target_encoder']
+        new_sd = {k[len('module.backbone.'):] if k.startswith('module.backbone.') else k: v
+                  for k, v in sd.items()}
+        encoder.load_state_dict(new_sd, strict=False)
+        del main_ckpt, sd
+
+        classifier = AttentiveClassifier(embed_dim=1024, num_heads=16, depth=1,
+                                         num_classes=2, dropout=0.1)
+        head_ckpt = torch.load(JEPA_HEAD, map_location='cpu', weights_only=False)
+        csd = head_ckpt['classifier']
+        csd = {k[len('module.'):] if k.startswith('module.') else k: v for k, v in csd.items()}
+        classifier.load_state_dict(csd)
+        del head_ckpt, csd
+
+        encoder.eval().half().to(DEVICE)
+        classifier.eval().half().to(DEVICE)
+        print("[JEPA] 二分类模型已加载 (vit_large 主干 + AttentiveClassifier 分类头)")
+        return encoder, classifier
+    except Exception as e:
+        print(f"[JEPA] 模型加载失败, 自动退回只靠视线夹角的旧版: {e}")
+        return None, None
+
+
+_JEPA_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+_JEPA_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+
+def pair_region(body_a, body_b, img_w, img_h, margin=JEPA_CROP_MARGIN):
+    """两人区域的联合框(身体框取并集) + 向外扩边, 返回 (x1,y1,x2,y2) 全分辨率坐标。"""
+    x1 = min(body_a[0], body_b[0]); y1 = min(body_a[1], body_b[1])
+    x2 = max(body_a[2], body_b[2]); y2 = max(body_a[3], body_b[3])
+    w = x2 - x1; h = y2 - y1
+    mx = w * margin; my = h * margin
+    x1 = max(0, int(x1 - mx)); y1 = max(0, int(y1 - my))
+    x2 = min(img_w, int(x2 + mx)); y2 = min(img_h, int(y2 + my))
+    return x1, y1, x2, y2
+
+
+def jepa_predict_pair(encoder, classifier, buf, region, device):
+    """对"两人区域"跑 JEPA, 返回 (P交头接耳, 预测类别)。
+
+    buf: 720p BGR 帧缓冲 (list/deque); region: (x1,y1,x2,y2) 720p 坐标。
+    """
+    idx = np.linspace(0, len(buf) - 1, JEPA_FRAMES).astype(int)
+    x1, y1, x2, y2 = region
+    if x2 - x1 < 8 or y2 - y1 < 8:
+        return 0.0, 0
+    crops = []
+    for i in idx:
+        c = buf[i][y1:y2, x1:x2]
+        crops.append(cv2.resize(c, (224, 224), interpolation=cv2.INTER_LINEAR))
+    x = np.stack(crops).astype(np.float32) / 255.0
+    x = x[..., ::-1]                                # BGR -> RGB
+    x = (x - _JEPA_MEAN) / _JEPA_STD
+    t = torch.from_numpy(x).permute(3, 0, 1, 2).unsqueeze(0).half().to(device)
+    with torch.no_grad():
+        feat = encoder(t)
+        logits = classifier(feat)
+        probs = torch.softmax(logits.float(), dim=1)[0].cpu().numpy()
+    return float(probs[1]), int(probs[1] >= probs[0])
 
 
 # ==============================================================================
@@ -301,6 +420,13 @@ if __name__ == '__main__':
     mean = torch.tensor([0.485, 0.456, 0.406], device=DEVICE).view(1, 3, 1, 1)
     std = torch.tensor([0.229, 0.224, 0.225], device=DEVICE).view(1, 3, 1, 1)
 
+    # ---------- 加载 JEPA (第二阶段二次确认) ----------
+    jepa_enc, jepa_clf = None, None
+    if JEPA_ENABLE:
+        jepa_enc, jepa_clf = load_jepa()
+        if jepa_enc is None:
+            print("[JEPA] 第二阶段不可用, 本次运行退回旧版 (只靠视线夹角判定)")
+
     # ---------- 逐个视频处理 ----------
     for vi, video_path in enumerate(video_files):
         name = os.path.splitext(os.path.basename(video_path))[0]
@@ -308,27 +434,36 @@ if __name__ == '__main__':
         dataset = LoadImages(video_path, img_size=imgsz, stride=stride, auto=True)
         fps = dataset.cap.get(cv2.CAP_PROP_FPS) or 25.0
 
+        w0 = int(dataset.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h0 = int(dataset.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        out_w = int(SAVE_HEIGHT * w0 / h0)
+        out_h = SAVE_HEIGHT
         writer, out_path = None, os.path.join(OUTPUT_DIR, name + "_chat.mp4")
         for codec in ['avc1', 'mp4v', 'XVID']:
-            w0 = int(dataset.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            h0 = int(dataset.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*codec), fps,
-                                     (int(SAVE_HEIGHT * w0 / h0), SAVE_HEIGHT))
+            writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*codec), fps, (out_w, out_h))
             if writer.isOpened():
                 break
         if writer is None or not writer.isOpened():
             print("!! 无法创建输出视频, 跳过"); continue
 
-        # 时序平滑状态 (每个视频重置)
+        # 时序平滑状态 + JEPA 缓冲 (每个视频重置)
         smoother = PairSmoother(SMOOTH_CONFIRM_FRAMES if SMOOTH_ENABLE else 1,
                                 SMOOTH_HOLD_FRAMES if SMOOTH_ENABLE else 0,
                                 SMOOTH_MATCH_DIST)
-        total_chat = 0
+        jepa_buf = deque(maxlen=JEPA_BUF_MAX)      # 720p 原始帧(无标注)缓冲
+        jepa_cache = {}                            # tid -> {'fi': 上次JEPA帧号, 'p_chat': P交头接耳}
         total_raw = 0
+        total_susp = 0
+        total_conf = 0
+        annotated = None                           # 上一帧标注画面(720p), 跳帧时复用
         for fi, (path, img, im0, _) in enumerate(tqdm(dataset, desc=name)):
-            if fi % FRAME_SKIP != 0:
-                continue
             img_h, img_w = im0.shape[:2]
+            if fi % FRAME_SKIP != 0:
+                jepa_buf.append(cv2.resize(im0, (out_w, out_h)))   # 跳帧: 原始帧也进缓冲
+                if annotated is not None:
+                    writer.write(annotated)                        # 复用上一帧标注
+                continue
+            jepa_buf.append(cv2.resize(im0, (out_w, out_h)))       # 当前原始帧进缓冲(供JEPA)
 
             # ===== 1. BPJDet 检测 (身体 + 人头) =====
             x = torch.from_numpy(img).to(DEVICE)
@@ -376,13 +511,15 @@ if __name__ == '__main__':
                     continue
                 if not (0.5 <= head_w / head_h <= 1.8):                 # 头长宽比
                     continue
-                head_boxes.append([int(hx1), int(hy1), int(hx2), int(hy2)])
+                head_boxes.append({'head': [int(hx1), int(hy1), int(hx2), int(hy2)],
+                                   'body': [int(bx1), int(by1), int(bx2), int(by2)]})
 
             # ===== 3. SemiUHPE 头姿 (yaw/pitch/roll) =====
             heads = []
             if head_boxes:
                 crops, tensors = [], []
-                for (hx1, hy1, hx2, hy2) in head_boxes:
+                for hb in head_boxes:
+                    hx1, hy1, hx2, hy2 = hb['head']
                     pcx, pcy = (hx1 + hx2) / 2.0, (hy1 + hy2) / 2.0
                     hs = max(hx2 - hx1, hy2 - hy1)
                     ex, ey = (0.5 - EDGES_SCALE) * hs, (0.5 - EDGES_SCALE) * hs
@@ -392,7 +529,7 @@ if __name__ == '__main__':
                     rgb = cv2.cvtColor(cv2.resize(crop, (224, 224), interpolation=cv2.INTER_LINEAR),
                                        cv2.COLOR_BGR2RGB)
                     tensors.append(torch.from_numpy(rgb.transpose(2, 0, 1)).float().div_(255.0))
-                    crops.append([nx1, ny1, nx2, ny2])
+                    crops.append([nx1, ny1, nx2, ny2, hb['body']])
                 batch = torch.stack(tensors).to(DEVICE, non_blocking=True)
                 batch = (batch - mean) / std
                 with torch.inference_mode():
@@ -405,36 +542,65 @@ if __name__ == '__main__':
                     ang = Rotation.from_matrix(rm).as_euler("xyz", degrees=True)
                     roll, pitch, yaw = list(map(limit_angle, [ang[2], ang[0] - 180, ang[1]]))
                     heads.append({'cx': (rb[0] + rb[2]) / 2.0, 'cy': (rb[1] + rb[3]) / 2.0,
-                                  'bbox': rb, 'yaw': yaw, 'pitch': pitch, 'roll': roll})
+                                  'bbox': rb[:4], 'body': rb[4],
+                                  'yaw': yaw, 'pitch': pitch, 'roll': roll})
 
             # ===== 4. 判定: 座位约束 + 视线夹角钝角 → 一对一匹配 =====
             raw_pairs = one_to_one(judge_pairs(heads, img_w))
             total_raw += len(raw_pairs)
 
-            # ===== 5. 时序平滑: 同一配对连续命中若干处理帧才确认 =====
-            pairs = smoother.update(raw_pairs, heads)
-            total_chat += len(pairs)
+            # ===== 5. 时序平滑 → 可疑配对 (带 track id) =====
+            suspicious = smoother.update(raw_pairs, heads)
+            total_susp += len(suspicious)
 
-            # ===== 6. 画结果 =====
-            for (i, j, gaze) in pairs:
+            # ===== 6. JEPA 二次确认 =====
+            sx, sy = out_w / img_w, out_h / img_h   # 全分辨率 → 720p 缩放比
+            confirmed = []      # JEPA 确认: (i, j, p_chat)
+            yellow = []         # 可疑但 JEPA 判否: (i, j)
+            for (i, j, gaze, tid) in suspicious:
+                if jepa_enc is not None and len(jepa_buf) >= JEPA_FRAMES:
+                    c = jepa_cache.get(tid)
+                    if c is None or (fi - c['fi']) >= JEPA_RERUN_INTERVAL:
+                        a, b = heads[i], heads[j]
+                        r = pair_region(a['body'], b['body'], img_w, img_h)
+                        r720 = (int(r[0] * sx), int(r[1] * sy), int(r[2] * sx), int(r[3] * sy))
+                        p_chat, _ = jepa_predict_pair(jepa_enc, jepa_clf, jepa_buf, r720, DEVICE)
+                        jepa_cache[tid] = {'fi': fi, 'p_chat': p_chat}
+                    else:
+                        p_chat = c['p_chat']
+                    if p_chat >= JEPA_CONFIRM_THRESH:
+                        confirmed.append((i, j, p_chat))
+                    else:
+                        yellow.append((i, j))
+                else:
+                    confirmed.append((i, j, 1.0))   # 无 JEPA 或历史不足 → 直接确认
+            total_conf += len(confirmed)
+
+            # ===== 7. 画结果: 红=确认交头接耳, 黄=可疑但被JEPA否决 =====
+            for (i, j, p_chat) in confirmed:
                 a, b = heads[i], heads[j]
                 cv2.line(im0, (int(a['cx']), int(a['cy'])), (int(b['cx']), int(b['cy'])),
                          (0, 0, 255), 3)
-                cv2.putText(im0, f"{min(1.0, gaze / 150.0):.0%}",
+                cv2.putText(im0, f"CHAT {p_chat:.0%}",
                             (int((a['cx'] + b['cx']) / 2) - 20, int((a['cy'] + b['cy']) / 2) - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
                 for p in (a, b):
                     x1, y1, x2, y2 = p['bbox']
                     cv2.rectangle(im0, (x1 - 4, y1 - 4), (x2 + 4, y2 + 4), (0, 0, 255), 3)
-                    cv2.putText(im0, "CHAT!", (x1, y1 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-            cv2.putText(im0, f"{len(heads)} Heads | {len(pairs)} Chat", (5, 25),
+            for (i, j) in yellow:
+                a, b = heads[i], heads[j]
+                for p in (a, b):
+                    x1, y1, x2, y2 = p['bbox']
+                    cv2.rectangle(im0, (x1 - 4, y1 - 4), (x2 + 4, y2 + 4), (0, 255, 255), 2)
+                cv2.putText(im0, "?", (int((a['cx'] + b['cx']) / 2) - 10, int((a['cy'] + b['cy']) / 2) - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            cv2.putText(im0, f"{len(heads)} Heads | {len(confirmed)} CHAT | {len(yellow)} ?", (5, 25),
                         cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
 
-            out = cv2.resize(im0, (int(SAVE_HEIGHT * img_w / img_h), SAVE_HEIGHT))
-            for _ in range(FRAME_SKIP):     # 跳帧处理, 重复写入保持原时长
-                writer.write(out)
+            annotated = cv2.resize(im0, (out_w, out_h))
+            writer.write(annotated)
 
         writer.release()
-        print(f"已保存: {out_path}  (原始 {total_raw} 对次 → 时序确认 {total_chat} 对次)")
+        print(f"已保存: {out_path}  (原始 {total_raw} 对次 → 可疑 {total_susp} 对次 → JEPA确认 {total_conf} 对次)")
 
     print("\n全部完成!")

@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>clip 浏览器解码自检</title></head>
+<body>
+<pre id="out">pending</pre>
+<script>
+// 用真实浏览器内核(Edge/Chrome 的 Blink + H.264 解码器)验证 clip 能否播放,
+// 并统计解码出来的画面像素, 判断是"真画面"还是"全黑"。
+const N = 3;
+
+function probe(src) {
+  return new Promise(res => {
+    const v = document.createElement('video');
+    v.muted = true; v.playsInline = true; v.preload = 'auto';
+    let done = false;
+    const finish = note => {
+      if (done) return; done = true;
+      const r = { clip: src.split('/').pop(), note,
+                  readyState: v.readyState, videoW: v.videoWidth, videoH: v.videoHeight,
+                  dur: isFinite(v.duration) ? +v.duration.toFixed(2) : null,
+                  err: v.error ? (v.error.code + ':' + (v.error.message || '')) : null };
+      if (v.videoWidth > 0) {
+        try {
+          const c = document.createElement('canvas');
+          c.width = v.videoWidth; c.height = v.videoHeight;
+          const ctx = c.getContext('2d');
+          ctx.drawImage(v, 0, 0, c.width, c.height);
+          const px = ctx.getImageData(0, 0, c.width, c.height).data;
+          const n = px.length / 4;
+          let s = 0, s2 = 0, dark = 0;
+          for (let i = 0; i < px.length; i += 4) {
+            const g = (px[i] + px[i + 1] + px[i + 2]) / 3;
+            s += g; s2 += g * g; if (g < 12) dark++;
+          }
+          const m = s / n;
+          r.pixMean = +m.toFixed(1);
+          r.pixStd = +Math.sqrt(Math.max(0, s2 / n - m * m)).toFixed(1);
+          r.darkPct = +(100 * dark / n).toFixed(1);
+        } catch (e) { r.canvasErr = String(e); }
+      }
+      res(r);
+    };
+    v.addEventListener('error', () => finish('error'));
+    v.addEventListener('loadeddata', () => { try { v.currentTime = 0.5; } catch (e) {} finish('loadeddata'); });
+    setTimeout(() => finish('timeout'), 2500);
+    v.src = src; v.load();
+  });
+}
+
+(async () => {
+  const out = [];
+  try {
+    const d = await (await fetch('/api/data')).json();
+    const clips = (d.rows || []).slice(0, N).map(r => '/' + String(r.clip).replace(/\\/g, '/'));
+    for (const c of clips) out.push(await probe(c));
+  } catch (e) { out.push({ fatal: String(e) }); }
+  const payload = JSON.stringify(out);
+  document.getElementById('out').textContent = 'RESULT ' + payload;
+  document.title = 'DONE';
+  try { await fetch('/_note', { method: 'POST', body: payload }); } catch (e) {}
+})();
+</script>
+</body>
+</html>

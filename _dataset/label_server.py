@@ -133,6 +133,12 @@ class Handler(SimpleHTTPRequestHandler):
         return super().do_GET()
 
     def do_POST(self):
+        if self.path == "/_note":          # 仅调试用: 把请求体原样落盘到 _note.json
+            n = int(self.headers.get("Content-Length", 0))
+            with open(os.path.join(ROOT, "_note.json"), "wb") as fh:
+                fh.write(self.rfile.read(n))
+            self._json({"ok": True})
+            return
         if self.path != "/api/label":
             self.send_error(404)
             return

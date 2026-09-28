@@ -30,3 +30,4 @@ __pycache__/
 # ===== 系统/编辑器 =====
 Thumbs.db
 .DS_Store
+_dataset/track.json

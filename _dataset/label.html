@@ -200,7 +200,7 @@ function drawMark(r) {
     d.style.width = bw + 'px';
     d.style.height = bh + 'px';
   }
-  curTrack = trackData[r.clip] || null;
+  curTrack = trackData[String(r.clip).replace(/\\/g, '/')] || null;
   position((ax - x1) / W, (ay - y1) / H, (bx - x1) / W, (by - y1) / H, dw, dh);
   ensureLoop();
 }

@@ -101,7 +101,12 @@ BH_RATIO_MIN, BH_RATIO_MAX = 2.5, 8.0   # 身体高/头高 的合理范围
 HEAD_MIN_RATIO, HEAD_MAX_RATIO = 0.015, 0.35   # 头宽占图宽的比例范围
 
 # ---- ① 座位约束 ----
-ROW_Y_RATIO = 1.2            # 同排判定: 两头中心高度差 ≤ 该倍数×平均头高 (前后排排除)
+ROW_Y_RATIO = 0.6            # ★同排判定: 两头中心高度差 ≤ 该倍数×平均头高
+                             #   2026-09-28 修正: 原为 1.2, 实测这个机位下"前后排"的人头高度差
+                             #   只有 0.5~1.2 倍头高, 1.2 根本拦不住 → 数据里混进大量"背对背"前后排。
+                             #   真正的同排(左右相邻)高度差约 0~0.5 倍头高, 故收紧到 0.6。
+HEAD_SIZE_RATIO_MAX = 1.5    # ★同排辅助判据: 两人头高比 ≤ 该值 (同排=同深度=头差不多大;
+                             #   前后排的人头大小差很多, 用这个兜底)
 NEAR_DX_RATIO = 3.0          # ★邻座判定: 两头水平距离 ≤ 该倍数×平均头高 (尺度无关!)
                              #   肩并肩坐着的人头距 ≈ 肩宽 ≈ 2 倍头高, 故 3.0 留了一点余量。
                              #   旧版用的是 SEAT_DIST_RATIO=0.35×图宽, 那是"按画面宽度"算的,
@@ -176,6 +181,8 @@ def judge_pairs(heads, img_w):
             dx = abs(a['cx'] - b['cx'])
             dy = abs(a['cy'] - b['cy'])
             if dy > ROW_Y_RATIO * ref_head:          # 不在同一排 (前后排)
+                continue
+            if max(h_a, h_b) / min(h_a, h_b) > HEAD_SIZE_RATIO_MAX:   # 深度不同(前后排), 兜底
                 continue
             if dx > NEAR_DX_RATIO * ref_head:        # 两人隔太远, 不是邻座
                 continue

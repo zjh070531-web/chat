@@ -201,6 +201,8 @@ def seat_pairs(heads, img_w):
             dy = abs(a["cy"] - b["cy"])
             if dy > V.ROW_Y_RATIO * ref_head:
                 continue
+            if max(h_a, h_b) / min(h_a, h_b) > V.HEAD_SIZE_RATIO_MAX:   # 深度不同(前后排)
+                continue
             if dx > V.NEAR_DX_RATIO * ref_head:     # ★真·邻座: 头距 ≤ 3 倍平均头高
                 continue
             if dx < dy * V.NEIGHBOR_DX_RATIO:

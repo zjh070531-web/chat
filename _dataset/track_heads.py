@@ -20,6 +20,12 @@ import numpy as np
 
 BASE = r"D:\chatting\_dataset"
 
+# ---- 追踪参数 ----
+CORR_THRESH = 0.35    # 模板相关度阈值: 低于它认为没匹配上(保持原位, 不跳变)
+SMOOTH = 0.6          # 位置 EMA 平滑系数: 越大越跟手、越小越稳 (0.6 = 平滑度较强)
+TPL_UPDATE = 0.25     # 模板自适应更新比例: 每帧把模板向新匹配到的头块靠拢一点,
+                      #   让模板跟着人的转头/侧脸走, 避免"第0帧的模板用3秒就过时"
+
 
 def main():
     csvp = os.path.join(BASE, "candidates.csv")
@@ -79,12 +85,27 @@ def main():
                     y0 = max(0, int(cy) - win)
                     x1 = min(Wf - tw, int(cx) + win)
                     y1 = min(Hf - th, int(cy) + win)
-                    if x1 - x0 >= tw and y1 - y0 >= th:   # ROI 必须不小于模板
+                    rx, ry = cx, cy                        # 默认: 保持原位
+                    if x1 - x0 >= tw and y1 - y0 >= th:
                         roi = f[y0:y1, x0:x1]
                         res = cv2.matchTemplate(roi, tmpl[c], cv2.TM_CCOEFF_NORMED)
                         _, mx, _, loc = cv2.minMaxLoc(res)
-                        if mx >= 0.4:                  # 相关度太低就保持原位, 不跳变
-                            centers[c] = (x0 + loc[0] + tw / 2.0, y0 + loc[1] + th / 2.0)
+                        if mx >= CORR_THRESH:
+                            rx = x0 + loc[0] + tw / 2.0
+                            ry = y0 + loc[1] + th / 2.0
+                    # 时序平滑: 新位置 = 匹配位置与上一帧位置的 EMA
+                    cx = SMOOTH * rx + (1.0 - SMOOTH) * cx
+                    cy = SMOOTH * ry + (1.0 - SMOOTH) * cy
+                    # 自适应模板: 取当前(平滑后)位置的头块, 向模板混入一点
+                    px0 = max(0, int(cx) - r0)
+                    py0 = max(0, int(cy) - r0)
+                    px1 = min(Wf, int(cx) + r0)
+                    py1 = min(Hf, int(cy) + r0)
+                    if px1 - px0 == tw and py1 - py0 == th:
+                        patch = f[py0:py1, px0:px1]
+                        tmpl[c] = cv2.addWeighted(tmpl[c], 1.0 - TPL_UPDATE,
+                                                  patch, TPL_UPDATE, 0)
+                    centers[c] = (cx, cy)
                 line += [centers[c][0] / Wf, centers[c][1] / Hf]
             tracks.append(line)
 

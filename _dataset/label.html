@@ -124,7 +124,7 @@ async function boot() {
   const r = await fetch('/api/data');
   const d = await r.json();
   rows = d.rows || []; labels = d.labels || {};
-  try { trackData = await (await fetch('/track.json')).json(); } catch (e) { trackData = {}; }
+  try { trackData = await (await fetch('/track.json?t=' + Date.now())).json(); } catch (e) { trackData = {}; }
   if (!rows.length) {
     $('main').innerHTML = '<div class="empty">candidates.csv 里没有候选样本</div>';
     return;

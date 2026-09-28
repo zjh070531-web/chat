@@ -145,7 +145,9 @@ function render() {
   $('m-src').textContent = String(r.src).split(/[\\\/]/).slice(-1)[0] + ' @ ' + r.sec + 's';
   $('m-pre').innerHTML = '<span class="tag ' + preCls(r.pre) + '">' + preText(r.pre) + '</span>';
   $('m-gaze').textContent = r.gaze + '°  /  ' + (r.toward === '1' ? '是' : '否');
-  $('m-dist').textContent = r.dist + ' / ' + r.head_h;
+  const pt = r.posture;
+  const ptText = pt === '0' ? '坐坐' : (pt === '1' ? '一坐一站' : (pt === '2' ? '都站' : ''));
+  $('m-dist').textContent = r.dist + ' / ' + r.head_h + (ptText ? '  |  ' + ptText : '');
   const l = labels[r.clip];
   $('m-lab').innerHTML = l === undefined
       ? '未标' : '<span class="tag ' + (l ? 't1' : 't0') + '">' + (l ? '交头接耳' : '正常') + '</span>';

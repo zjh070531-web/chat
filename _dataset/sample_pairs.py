@@ -61,6 +61,8 @@ MAX_PER_VIDEO = 60           # 每个源视频最多导出多少 clip(全局按�
 PRE1_GAZE = 100.0            # 预标 1 的视线夹角阈值(与 v1 一致)
 PRE2_GAZE = 70.0             # 预标 2 的阈值
 MAX_PER_CLASS = 1200         # 每类上限(全局); 设很大 = 基本不截断, 保留自然分布
+SIT_STAND_RATIO = 5.5        # 坐/站判据: 身头比(身体高/头高) >= 该值算"站着"(坐着约 3~4.5, 站着约 6+)
+                             #   用于配对优先级: 优先两个都坐着的, 少选"一坐一站"的
 
 DEVICE = V.DEVICE
 IMGSZ = V.IMGSZ
@@ -363,7 +365,7 @@ def dump_csv(rows, out_dir):
         wr = csv.DictWriter(fh, fieldnames=["clip", "src", "frame", "sec", "pre",
                                             "gaze", "toward", "dist", "head_h",
                                             "x1", "y1", "x2", "y2",
-                                            "ax", "ay", "bx", "by"])
+                                            "ax", "ay", "bx", "by", "ra", "rb", "posture"])
         wr.writeheader()
         wr.writerows(rows)
     return p
@@ -456,15 +458,17 @@ def main():
             for (i, j, gaze, toward) in seat_pairs(heads, img_w):
                 a, b = heads[i], heads[j]
                 hh = ((a["bbox"][3] - a["bbox"][1]) + (b["bbox"][3] - b["bbox"][1])) / 2.0
+                ra = (a["body"][3] - a["body"][1]) / max(1, a["bbox"][3] - a["bbox"][1])
+                rb = (b["body"][3] - b["body"][1]) / max(1, b["bbox"][3] - b["bbox"][1])
+                posture = (1 if ra >= SIT_STAND_RATIO else 0) + (1 if rb >= SIT_STAND_RATIO else 0)
                 cands.append({
                     "fi": fi, "gaze": gaze, "toward": toward, "hh": hh, "a": a, "b": b,
-                    "pre": prelabel(gaze, toward),
+                    "pre": prelabel(gaze, toward), "posture": posture, "ra": ra, "rb": rb,
                     "mcx": (a["cx"] + b["cx"]) / 2.0, "mcy": (a["cy"] + b["cy"]) / 2.0,
                 })
-        # ---- 全局排序: 先"双方都朝对方看"的, 再按夹角从大到小; 再按 2:1 交替 ----
-        # 两类都要有: "互相朝向"的是部署时第一段真正会抓的分布(难样本集中在这里),
-        # 其余的高夹角配对提供普通负样本, 也覆盖不同夹角区间, 免得模型只认一个角度。
-        cands.sort(key=lambda c: (0 if c["toward"] else 1, -c["gaze"]))
+        # ---- 全局排序: 组内先"两个都坐着"(posture=0) → 一坐一站(1) → 都站着(2),
+        #      再按视线夹角从大到小; 最后"互相朝向"与其余按 2:1 交替 ----
+        cands.sort(key=lambda c: (0 if c["toward"] else 1, c["posture"], -c["gaze"]))
         tow = [c for c in cands if c["toward"]]
         oth = [c for c in cands if not c["toward"]]
         cands, i1, i2 = [], 0, 0
@@ -506,6 +510,7 @@ def main():
                 "x1": box[0], "y1": box[1], "x2": box[2], "y2": box[3],
                 "ax": round(a["cx"], 1), "ay": round(a["cy"], 1),
                 "bx": round(b["cx"], 1), "by": round(b["cy"], 1),
+                "ra": round(c["ra"], 2), "rb": round(c["rb"], 2), "posture": c["posture"],
             })
             recent.append((fi, c["mcx"], c["mcy"]))
             counts[pre] += 1

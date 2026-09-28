@@ -23,6 +23,7 @@ import argparse
 import csv
 import math
 import os
+import re
 import subprocess
 import sys
 
@@ -422,6 +423,8 @@ def main():
             print(f"[{vi}/{len(videos)}] [跳过] 已采过: {os.path.basename(vpath)}")
             continue
         stem = os.path.splitext(os.path.basename(vpath))[0]
+        stem = re.sub(r"[^A-Za-z0-9]+", "_", stem).strip("_") or f"vid{vi}"
+        # 中文/特殊字符文件名会污染 clip 名与 URL, 统一转成 ASCII 安全名
         cap = cv2.VideoCapture(vpath)
         if not cap.isOpened():
             print(f"[{vi}] [跳过] 打不开: {vpath}")

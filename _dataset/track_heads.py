@@ -73,38 +73,54 @@ def main():
                 tmpl[c] = frames[0][y0:y1, x0:x1]
             centers[c] = (cx, cy)
 
-        win = r0 + 20
+        win1 = r0 + 20                                  # 常规搜索半径
+        win2 = r0 + 60                                  # 走动/快移时的扩大搜索半径
+        scales = [1.0, 0.85, 1.18]                      # 多尺度: 处理人走近/走远的尺寸变化
         tracks = []
+
+        def best_match(f, tpl, cx, cy, win):
+            """在 (cx,cy) 周围 ±win、多个尺度里搜最佳匹配, 返回 (corr, rx, ry)"""
+            th, tw = tpl.shape[:2]
+            best = (-1.0, cx, cy)
+            for sc in scales:
+                ntw, nth = max(8, int(round(tw * sc))), max(8, int(round(th * sc)))
+                x0 = max(0, int(cx) - win)
+                y0 = max(0, int(cy) - win)
+                x1 = min(Wf - ntw, int(cx) + win)
+                y1 = min(Hf - nth, int(cy) + win)
+                if x1 - x0 < ntw or y1 - y0 < nth:
+                    continue
+                rtpl = cv2.resize(tpl, (ntw, nth), interpolation=cv2.INTER_LINEAR)
+                roi = f[y0:y1, x0:x1]
+                res = cv2.matchTemplate(roi, rtpl, cv2.TM_CCOEFF_NORMED)
+                _, mx, _, loc = cv2.minMaxLoc(res)
+                if mx > best[0]:
+                    best = (mx, x0 + loc[0] + ntw / 2.0, y0 + loc[1] + nth / 2.0)
+            return best
+
         for f in frames:
             line = []
             for c in range(2):
                 cx, cy = centers[c]
                 if tmpl[c] is not None and tmpl[c].size > 0:
-                    th, tw = tmpl[c].shape[:2]
-                    x0 = max(0, int(cx) - win)
-                    y0 = max(0, int(cy) - win)
-                    x1 = min(Wf - tw, int(cx) + win)
-                    y1 = min(Hf - th, int(cy) + win)
-                    rx, ry = cx, cy                        # 默认: 保持原位
-                    if x1 - x0 >= tw and y1 - y0 >= th:
-                        roi = f[y0:y1, x0:x1]
-                        res = cv2.matchTemplate(roi, tmpl[c], cv2.TM_CCOEFF_NORMED)
-                        _, mx, _, loc = cv2.minMaxLoc(res)
-                        if mx >= CORR_THRESH:
-                            rx = x0 + loc[0] + tw / 2.0
-                            ry = y0 + loc[1] + th / 2.0
-                    # 时序平滑: 新位置 = 匹配位置与上一帧位置的 EMA
-                    cx = SMOOTH * rx + (1.0 - SMOOTH) * cx
-                    cy = SMOOTH * ry + (1.0 - SMOOTH) * cy
-                    # 自适应模板: 取当前(平滑后)位置的头块, 向模板混入一点
-                    px0 = max(0, int(cx) - r0)
-                    py0 = max(0, int(cy) - r0)
-                    px1 = min(Wf, int(cx) + r0)
-                    py1 = min(Hf, int(cy) + r0)
-                    if px1 - px0 == tw and py1 - py0 == th:
-                        patch = f[py0:py1, px0:px1]
-                        tmpl[c] = cv2.addWeighted(tmpl[c], 1.0 - TPL_UPDATE,
-                                                  patch, TPL_UPDATE, 0)
+                    corr, rx, ry = best_match(f, tmpl[c], cx, cy, win1)
+                    if corr < CORR_THRESH:             # 小窗没跟上(人走快了) → 扩大窗口再搜
+                        corr2, rx2, ry2 = best_match(f, tmpl[c], cx, cy, win2)
+                        if corr2 > corr:
+                            corr, rx, ry = corr2, rx2, ry2
+                    if corr >= CORR_THRESH:
+                        cx = SMOOTH * rx + (1.0 - SMOOTH) * cx
+                        cy = SMOOTH * ry + (1.0 - SMOOTH) * cy
+                        # 自适应模板: 取当前(平滑后)位置的头块, 向模板混入一点
+                        th, tw = tmpl[c].shape[:2]
+                        px0 = max(0, int(cx) - r0)
+                        py0 = max(0, int(cy) - r0)
+                        px1 = min(Wf, int(cx) + r0)
+                        py1 = min(Hf, int(cy) + r0)
+                        if px1 - px0 == tw and py1 - py0 == th:
+                            patch = f[py0:py1, px0:px1]
+                            tmpl[c] = cv2.addWeighted(tmpl[c], 1.0 - TPL_UPDATE,
+                                                      patch, TPL_UPDATE, 0)
                     centers[c] = (cx, cy)
                 line += [centers[c][0] / Wf, centers[c][1] / Hf]
             tracks.append(line)

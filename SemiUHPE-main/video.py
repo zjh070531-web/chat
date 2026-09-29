@@ -38,6 +38,8 @@ from src.config import get_config
 from src.agent import get_agent
 from src.fisher.fisher_utils import batch_torch_A_to_R
 from src.utils import limit_angle
+from src.renderer import Renderer
+from src.vis_plot import convert_rotmat_bbox_to_6dof
 from utils.general import check_img_size, scale_coords, non_max_suppression
 from utils.datasets import LoadImages
 from models.experimental import attempt_load
@@ -147,6 +149,10 @@ JEPA_FRAME_STEP = 4           # 帧步长 4 → 16×4=64 帧 ≈ 3.2s 的时间�
 JEPA_BUF_MAX = 64             # 帧缓冲上限(原始帧数), 存 720p 降采样
 JEPA_RERUN_INTERVAL = 60      # 同一配对每隔多少原始帧才重跑一次 JEPA (节流, 60≈3秒)
                               # 裁剪规格见上面 PAIR_CROP_K / PAIR_CROP_DY / PAIR_PREP_SIZE
+
+# ---- 3D 人脸可视化 (Sim3DR: 在每个头上叠加一个 3D 头模, 朝向=估出的头姿) ----
+FACE3D_ENABLE = True          # 关掉 = 不渲染 3D 人脸
+FACE3D_ALPHA = 0.9            # 3D 人脸叠加透明度 (0=原图, 1=全脸)
 
 # ---- 模型设置 (勿改) ----
 DEVICE = 'cuda:0'
@@ -478,6 +484,18 @@ if __name__ == '__main__':
     det_model = det_model.half()
     print(f"[模型] BPJDet imgsz={imgsz} + SemiUHPE(ResNet50) 已加载")
 
+    # ---------- 加载 3D 人脸渲染 (Sim3DR) ----------
+    renderer = None
+    if FACE3D_ENABLE:
+        try:
+            renderer = Renderer(
+                vertices_path=os.path.join(PY_ROOT, "pose_references", "vertices_trans.npy"),
+                triangles_path=os.path.join(PY_ROOT, "pose_references", "triangles.npy"),
+            )
+            print("[模型] Sim3DR 3D 人脸渲染已加载")
+        except Exception as e:
+            print(f"[3D人脸] 加载失败, 本次不渲染 3D 人脸: {e}")
+
     mean = torch.tensor([0.485, 0.456, 0.406], device=DEVICE).view(1, 3, 1, 1)
     std = torch.tensor([0.229, 0.224, 0.225], device=DEVICE).view(1, 3, 1, 1)
 
@@ -577,6 +595,7 @@ if __name__ == '__main__':
 
             # ===== 3. SemiUHPE 头姿 (yaw/pitch/roll) =====
             heads = []
+            face_poses = []                    # (rot_mat, head_bbox) 供 3D 人脸渲染
             if head_boxes:
                 crops, tensors = [], []
                 for hb in head_boxes:
@@ -605,6 +624,19 @@ if __name__ == '__main__':
                     heads.append({'cx': (rb[0] + rb[2]) / 2.0, 'cy': (rb[1] + rb[3]) / 2.0,
                                   'bbox': rb[:4], 'body': rb[4],
                                   'yaw': yaw, 'pitch': pitch, 'roll': roll})
+                    face_poses.append((rot_mats[k], head_boxes[k]['head']))
+
+            # ===== 3.5 3D 人脸可视化 (Sim3DR) =====
+            if FACE3D_ENABLE and renderer is not None and face_poses:
+                try:
+                    global_intrinsics = np.array(
+                        [[img_w + img_h, 0, img_w // 2], [0, img_w + img_h, img_h // 2], [0, 0, 1]])
+                    poses = [convert_rotmat_bbox_to_6dof(rm, bbox, global_intrinsics)
+                             for (rm, bbox) in face_poses]
+                    trans_verts = renderer.transform_vertices(im0, poses, global_intrinsics)
+                    im0 = renderer.render(im0, trans_verts, alpha=FACE3D_ALPHA)
+                except Exception as e:
+                    print(f"[3D人脸] 渲染失败: {e}")
 
             # ===== 4. 判定: 座位约束 + 视线夹角钝角 → 一对一匹配 =====
             raw_pairs = one_to_one(judge_pairs(heads, img_w))

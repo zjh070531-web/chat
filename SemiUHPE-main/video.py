@@ -2,8 +2,9 @@
 r"""
 交头接耳检测 v1 (精简版, 从零手写)
 
-判定逻辑四步:
-  ① 座位约束  - 只判同一排的左右邻座 (前后排的人直接排除)
+判定逻辑五步:
+  ⓪ 桌子坐标系 - 从所有人的"脚点"自动拟合桌线/消失点, 以桌子(而非摄像头)为坐标系
+  ① 座位约束  - 只判同一张桌子的左右邻座 (前后排/隔桌的人直接排除)
   ② 视线夹角  - 两人头部朝向夹角达到钝角 = 相互对看 (= 交头接耳)
   ③ 一对一匹配 - 按夹角排序贪心, 一个人只能和一个人配对
   ④ 时序平滑  - 同一配对连续命中若干处理帧才确认, 确认后允许短暂漏检
@@ -19,6 +20,7 @@ import os
 import sys
 import glob
 import math
+import random
 from collections import deque
 
 import cv2
@@ -102,19 +104,43 @@ MIN_BODY_WIDTH = 30          # 最小身体宽度(像素)
 BH_RATIO_MIN, BH_RATIO_MAX = 2.5, 8.0   # 身体高/头高 的合理范围
 HEAD_MIN_RATIO, HEAD_MAX_RATIO = 0.015, 0.35   # 头宽占图宽的比例范围
 
-# ---- ① 座位约束 ----
-ROW_Y_RATIO = 0.6            # ★同排判定: 两头中心高度差 ≤ 该倍数×平均头高
-                             #   2026-09-28 修正: 原为 1.2, 实测这个机位下"前后排"的人头高度差
-                             #   只有 0.5~1.2 倍头高, 1.2 根本拦不住 → 数据里混进大量"背对背"前后排。
-                             #   真正的同排(左右相邻)高度差约 0~0.5 倍头高, 故收紧到 0.6。
-HEAD_SIZE_RATIO_MAX = 1.5    # ★同排辅助判据: 两人头高比 ≤ 该值 (同排=同深度=头差不多大;
-                             #   前后排的人头大小差很多, 用这个兜底)
-NEAR_DX_RATIO = 3.0          # ★邻座判定: 两头水平距离 ≤ 该倍数×平均头高 (尺度无关!)
+# ---- ① 座位约束 (三种判据, SEAT_MODE 二选一) ----
+# 旧判据("image")的问题: 摄像头是斜俯视角, 图像里的"上下"≠教室里的"前后",
+# 同一张桌子的相邻两人在画面里是斜着排列的, 按图像 dx/dy 判同排会把他们误判成"前后排"。
+SEAT_MODE = "depth"          # ★"depth"=同深度判同桌(推荐, 与摄像头视角无关)
+                             #      "desk" =桌线法(规则教室, 跨帧累积脚点拟合桌线)
+                             #      "image"=旧版图像坐标判定 (仅作对照)
+SEAT_DEPTH_RATIO_MAX = 1.20  # ★[depth] 同深度=同桌: 两人头高比 ≤ 该值
+                             #   同桌相邻的人离镜头距离一样 → 头一样大(比值≈1.0~1.1);
+                             #   前后排的人深度差明显 → 头大小差得更多(实测 ≥1.2)。
+                             #   这是"同排"最稳的判据: 与摄像头斜不斜、桌子怎么摆都无关。
+SEAT_DIST_RATIO = 3.0        # ★邻座: 两人距离 ≤ 该倍数×平均头高 (尺度无关!)
                              #   肩并肩坐着的人头距 ≈ 肩宽 ≈ 2 倍头高, 故 3.0 留了一点余量。
-                             #   旧版用的是 SEAT_DIST_RATIO=0.35×图宽, 那是"按画面宽度"算的,
-                             #   在 4K 画面里 ≈ 1344px ≈ 13 倍头高, 会把隔 3~4 个座位的人
-                             #   也当成"邻座", 是误判的一大来源 —— 已废弃。
-NEIGHBOR_DX_RATIO = 0.5      # 左右相邻: 水平距离 ≥ 垂直距离×该比例
+HEAD_SIZE_RATIO_MAX = 1.5    # 头高比上限 (desk/image 模式的深度兜底; depth 模式用上面的
+                             #   SEAT_DEPTH_RATIO_MAX, 更严)
+ROW_Y_RATIO = 0.6            # [image 模式] 同排: 两头中心图像高度差 ≤ 该倍数×平均头高
+NEAR_DX_RATIO = 3.0          # [image 模式] 邻座: 两头水平距离 ≤ 该倍数×平均头高
+NEIGHBOR_DX_RATIO = 0.5      # [image 模式] 左右相邻: 水平距离 ≥ 垂直距离×该比例
+DESK_FRAME_ENABLE = SEAT_MODE == "desk"   # 向下兼容: desk 模式才启用桌线法
+
+# ---- ① 座位约束: 桌子坐标系 (2026-09-29 新增, 推荐) ----
+# 原理: 人坐着不动, 把整段视频里所有人的"脚点"(身体框底部中心 ≈ 椅子位置, 接近地面)
+#       累积起来 RANSAC 拟合桌线 —— 真实桌线会有大量支持点, 巧合共线是零星的。
+#       判定两人: 是否存在一条桌线同时经过两人的脚点(垂直偏移 ≤ 阈值),
+#       且两人沿这条桌线的距离 ≤ 邻座上限 —— 即"同一张桌子的左右邻座"。
+#       前后排/隔桌/过道对面的人不在同一条桌线上, 直接排除。
+#       这样判的是"桌子坐标系", 与摄像头是斜俯视还是正俯视无关。
+DESK_FRAME_ENABLE = True     # ★True=用桌子坐标系; False=退回旧版图像坐标判定
+DESK_ANGLE_MANUAL = None     # 手动指定桌子方向角(度, 图像x轴起算); None=自动拟合桌线
+                             #   自动拟合失败的场景(人太少/桌线不规则)可用它手动兜底
+DESK_ROW_RATIO = 0.9         # ★同排: 脚点到桌线的垂直偏移 ≤ 该倍数×平均头高
+DESK_NEAR_RATIO = 3.0        # ★邻座: 同一桌线上两人沿桌距离 ≤ 该倍数×平均头高
+DESK_LINE_INLIER = 0.8       # 拟合桌线时的内点距离 (×中位头高)
+DESK_MIN_LINE_PTS = 40       # 一条桌线至少要积累的脚点数 (过滤巧合共线)
+DESK_MIN_FEET = 60           # 脚点总数少于该值时退回旧版图像坐标判定 (视频开头)
+DESK_POINTS_MAX = 4000       # 脚点缓冲上限 (滚动覆盖)
+DESK_REEST_INTERVAL = 30     # 每隔多少个处理帧重新拟合一次桌线
+DESK_MAX_LINES = 4           # 最多拟合几条桌线 (房间里有几排桌子)
 
 # ---- 两人区域裁剪规格 (★训练与推理必须完全一致, 改这里两边一起变) ----
 # 以两头中心连线的中点为心作正方形, 边长只由"平均头高"决定 → 取景尺度恒定,
@@ -168,10 +194,111 @@ SAVE_HEIGHT = 720            # 输出视频高度
 
 
 # ==============================================================================
-# 配对判定: 座位约束 + 视线夹角钝角
+# ① 座位约束: 桌子坐标系 (累积脚点 → RANSAC 拟合桌线 → 同线判同桌)
 # ==============================================================================
-def judge_pairs(heads, img_w):
-    """heads: [{cx,cy,bbox,yaw,...}]; 返回通过判定的配对列表 [(i, j, 夹角)]"""
+def feet_point(h):
+    """人的"脚点" = 身体框底部中心 (坐着的人≈椅子位置, 接近地面, 是最好的地面投影点)"""
+    body = h.get('body')
+    if not body or body[2] <= body[0] or body[3] <= body[1]:
+        return None
+    return ((body[0] + body[2]) / 2.0, float(body[3]))
+
+
+def fit_desk_lines(pts, ref_h):
+    """RANSAC 迭代提取桌线。pts: [(x,y) 脚点]; ref_h: 中位头高(尺度基准)。
+    返回 [(mx,my,dx,dy,n_inliers,angle_deg), ...] (dx,dy 为单位方向)。"""
+    if ref_h <= 0 or len(pts) < DESK_MIN_LINE_PTS:
+        return []
+    P = np.array(pts, dtype=np.float64)
+    if len(P) > 1500:                        # 采样上限, 保证拟合速度
+        rng0 = np.random.RandomState(0)
+        P = P[rng0.choice(len(P), 1500, replace=False)]
+    rng = random.Random(0)
+    tol = DESK_LINE_INLIER * ref_h
+    min_sep = 6.0 * ref_h                    # 采样的两点要有一定距离
+    lines = []
+    for _ in range(DESK_MAX_LINES):
+        best, best_n = None, 0
+        for _ in range(600):
+            i, j = rng.randrange(len(P)), rng.randrange(len(P))
+            if i == j:
+                continue
+            p, q = P[i], P[j]
+            L = math.hypot(q[0] - p[0], q[1] - p[1])
+            if L < min_sep:
+                continue
+            dx, dy = (q[0] - p[0]) / L, (q[1] - p[1]) / L
+            d = np.abs((P[:, 0] - p[0]) * dy - (P[:, 1] - p[1]) * dx)
+            n = int((d <= tol).sum())
+            if n > best_n:
+                best_n, best = n, (p[0], p[1], dx, dy)
+        if best is None or best_n < DESK_MIN_LINE_PTS:
+            break
+        mx, my, dx, dy = best
+        d = np.abs((P[:, 0] - mx) * dy - (P[:, 1] - my) * dx)
+        inl = P[d <= tol]
+        # PCA 精修方向
+        c = inl.mean(axis=0)
+        x = inl[:, 0] - c[0]
+        y = inl[:, 1] - c[1]
+        cov = np.array([[np.dot(x, x), np.dot(x, y)], [np.dot(x, y), np.dot(y, y)]])
+        _, vecs = np.linalg.eigh(cov)
+        dd = vecs[:, -1]
+        dx, dy = float(dd[0]), float(dd[1])
+        ang = ((math.degrees(math.atan2(dy, dx)) + 90.0) % 180.0) - 90.0
+        lines.append((float(c[0]), float(c[1]), dx, dy, len(inl), ang))
+        # 去掉这条线的内点, 继续找下一条桌线
+        keep = np.abs((P[:, 0] - c[0]) * dy - (P[:, 1] - c[1]) * dx) > tol
+        P = P[keep]
+        if len(P) < DESK_MIN_LINE_PTS:
+            break
+    return lines
+
+
+class DeskFrame:
+    """桌子坐标系状态: 跨帧累积脚点, 周期性重拟合桌线。"""
+
+    def __init__(self):
+        self.pts = deque(maxlen=DESK_POINTS_MAX)
+        self.head_hs = deque(maxlen=DESK_POINTS_MAX)
+        self.lines = []                # fit_desk_lines 的结果
+        self.since_est = DESK_REEST_INTERVAL   # 让第一次 update 就尝试估计
+
+    def update(self, heads):
+        """每个处理帧调用: 收集脚点/头高, 到期重拟合桌线"""
+        for h in heads:
+            f = feet_point(h)
+            if f is not None:
+                self.pts.append(f)
+            bb = h['bbox']
+            self.head_hs.append(bb[3] - bb[1])
+        self.since_est += 1
+        if self.since_est >= DESK_REEST_INTERVAL:
+            self.since_est = 0
+            hs = sorted(self.head_hs)
+            ref_h = hs[len(hs) // 2] if hs else 0.0
+            self.lines = fit_desk_lines(list(self.pts), ref_h)
+
+    def has_lines(self):
+        return len(self.lines) > 0
+
+    def same_desk(self, ga, gb, ref_head):
+        """两脚点是否"同一张桌子的邻座": 同在一条桌线附近 + 沿桌距离近"""
+        for (mx, my, dx, dy, _, _) in self.lines:
+            da = abs((ga[0] - mx) * dy - (ga[1] - my) * dx)
+            db = abs((gb[0] - mx) * dy - (gb[1] - my) * dx)
+            if da <= DESK_ROW_RATIO * ref_head and db <= DESK_ROW_RATIO * ref_head:
+                if abs((gb[0] - ga[0]) * dx + (gb[1] - ga[1]) * dy) <= DESK_NEAR_RATIO * ref_head:
+                    return True
+        return False
+
+
+# ==============================================================================
+# 配对判定: 座位约束(桌子坐标系) + 视线夹角钝角
+# ==============================================================================
+def judge_pairs(heads, desk):
+    """heads: [{cx,cy,bbox,body,yaw,...}]; desk: DeskFrame
+    返回通过判定的配对列表 [(i, j, 夹角)]"""
     pairs = []
     n = len(heads)
     for i in range(n):
@@ -184,25 +311,66 @@ def judge_pairs(heads, img_w):
             if h_a <= 0 or h_b <= 0:
                 continue
             ref_head = (h_a + h_b) * 0.5
-            dx = abs(a['cx'] - b['cx'])
-            dy = abs(a['cy'] - b['cy'])
-            if dy > ROW_Y_RATIO * ref_head:          # 不在同一排 (前后排)
-                continue
-            if max(h_a, h_b) / min(h_a, h_b) > HEAD_SIZE_RATIO_MAX:   # 深度不同(前后排), 兜底
-                continue
-            if dx > NEAR_DX_RATIO * ref_head:        # 两人隔太远, 不是邻座
-                continue
-            if dx < dy * NEIGHBOR_DX_RATIO:          # 偏前后而不是左右
-                continue
+
+            if SEAT_MODE == "depth":
+                # ---- 同深度 = 同排/同桌: 头的大小就是深度, 与摄像头视角无关 ----
+                if max(h_a, h_b) / min(h_a, h_b) > SEAT_DEPTH_RATIO_MAX:
+                    continue                             # 深度不同 = 前后排/隔桌
+                if math.hypot(a['cx'] - b['cx'], a['cy'] - b['cy']) > SEAT_DIST_RATIO * ref_head:
+                    continue                             # 隔太远, 不是邻座
+
+            elif SEAT_MODE == "desk":
+                # ---- 桌线法: 两人脚点必须同在一条拟合出的桌线上 ----
+                if max(h_a, h_b) / min(h_a, h_b) > HEAD_SIZE_RATIO_MAX:   # 深度兜底
+                    continue
+                ga, gb = feet_point(a), feet_point(b)
+                if ga is None or gb is None:
+                    continue
+                if DESK_ANGLE_MANUAL is not None:
+                    t = math.radians(DESK_ANGLE_MANUAL)
+                    ux, uy = math.cos(t), math.sin(t)
+                    vx, vy = gb[0] - ga[0], gb[1] - ga[1]
+                    if abs(vx * uy - vy * ux) > DESK_ROW_RATIO * ref_head:
+                        continue                         # 垂直桌方向偏太多 = 不同一排
+                    if abs(vx * ux + vy * uy) > DESK_NEAR_RATIO * ref_head:
+                        continue                         # 沿桌方向隔太远 = 不是邻座
+                elif desk.has_lines():
+                    if not desk.same_desk(ga, gb, ref_head):
+                        continue
+                else:
+                    # 桌线还没拟合出来: 退回旧版图像坐标判据
+                    dx = abs(a['cx'] - b['cx'])
+                    dy = abs(a['cy'] - b['cy'])
+                    if dy > ROW_Y_RATIO * ref_head or dx > NEAR_DX_RATIO * ref_head \
+                            or dx < dy * NEIGHBOR_DX_RATIO:
+                        continue
+
+            else:
+                # ---- 旧版: 图像坐标判定 (摄像头视角) ----
+                if max(h_a, h_b) / min(h_a, h_b) > HEAD_SIZE_RATIO_MAX:
+                    continue
+                dx = abs(a['cx'] - b['cx'])
+                dy = abs(a['cy'] - b['cy'])
+                if dy > ROW_Y_RATIO * ref_head:          # 不在同一排 (前后排)
+                    continue
+                if dx > NEAR_DX_RATIO * ref_head:        # 两人隔太远, 不是邻座
+                    continue
+                if dx < dy * NEIGHBOR_DX_RATIO:          # 偏前后而不是左右
+                    continue
 
             # ---------- ② 视线夹角 (钝角 = 相互对看) ----------
             ya, yb = YAW_SIGN * a['yaw'], YAW_SIGN * b['yaw']
             if abs(ya) < MIN_TURN_YAW or abs(yb) < MIN_TURN_YAW:
                 continue                              # 有人没转头
             # 方向检查: 两人都得朝向对方 (否则背对背也是钝角)
+            # ★符号约定(2026-09-29 实测核实, 别再改反):
+            #   ya = YAW_SIGN(-1) × yaw;  用旋转矩阵的"面部朝前向量"投影到图像验证过
+            #   (52 个样本无一例外): yaw>0 ⇔ fwd_x<0 ⇔ 朝图像【左】。
+            #   所以 ya = -yaw ⇒ ya>0 = 朝图像【右】, ya<0 = 朝图像【左】。
+            #   左边的人要朝右看(ya>0), 右边的人要朝左看(ya<0), 才是相互对看。
             a_on_left = a['cx'] < b['cx']
-            a_toward_b = (ya < 0) if a_on_left else (ya > 0)
-            b_toward_a = (yb > 0) if a_on_left else (yb < 0)
+            a_toward_b = (ya > 0) if a_on_left else (ya < 0)
+            b_toward_a = (yb < 0) if a_on_left else (yb > 0)
             if not (a_toward_b and b_toward_a):
                 continue
             gaze = abs(ya - yb)
@@ -612,6 +780,7 @@ if __name__ == '__main__':
         smoother = PairSmoother(SMOOTH_CONFIRM_FRAMES if SMOOTH_ENABLE else 1,
                                 SMOOTH_HOLD_FRAMES if SMOOTH_ENABLE else 0,
                                 SMOOTH_MATCH_DIST)
+        desk_frame = DeskFrame()                   # 桌子坐标系状态 (跨帧累积脚点)
         jepa_buf = deque(maxlen=JEPA_BUF_MAX)      # 720p 原始帧(无标注)缓冲
         jepa_cache = {}                            # tid -> {'fi': 上次JEPA帧号, 'p_chat': P交头接耳}
         total_raw = 0
@@ -721,15 +890,18 @@ if __name__ == '__main__':
                 except Exception as e:
                     print(f"[3D人脸] 渲染失败: {e}")
 
-            # ===== 4. 判定: 座位约束 + 视线夹角钝角 → 一对一匹配 =====
-            raw_pairs = one_to_one(judge_pairs(heads, img_w))
+            # ===== 4. 桌子坐标系: 累积脚点 → 周期性拟合桌线 =====
+            desk.update(heads)
+
+            # ===== 5. 判定: 座位约束(桌子坐标) + 视线夹角钝角 → 一对一匹配 =====
+            raw_pairs = one_to_one(judge_pairs(heads, desk_frame))
             total_raw += len(raw_pairs)
 
-            # ===== 5. 时序平滑 → 可疑配对 (带 track id) =====
+            # ===== 6. 时序平滑 → 可疑配对 (带 track id) =====
             suspicious = smoother.update(raw_pairs, heads)
             total_susp += len(suspicious)
 
-            # ===== 6. JEPA 二次确认 =====
+            # ===== 7. JEPA 二次确认 =====
             sx, sy = out_w / img_w, out_h / img_h   # 全分辨率 → 720p 缩放比
             confirmed = []      # JEPA 确认: (i, j, p_chat)
             yellow = []         # 可疑但 JEPA 判否: (i, j)
@@ -752,7 +924,7 @@ if __name__ == '__main__':
                     confirmed.append((i, j, gaze))   # 无 JEPA: 直接确认, 附上视线夹角(度)
             total_conf += len(confirmed)
 
-            # ===== 7. 画结果: 红=确认交头接耳, 黄=可疑但被JEPA否决 =====
+            # ===== 8. 画结果: 红=确认交头接耳, 黄=可疑但被JEPA否决 =====
             for (i, j, p_chat) in confirmed:
                 a, b = heads[i], heads[j]
                 cv2.line(im0, (int(a['cx']), int(a['cy'])), (int(b['cx']), int(b['cy'])),
@@ -773,6 +945,30 @@ if __name__ == '__main__':
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
             cv2.putText(im0, f"{len(heads)} Heads | {len(confirmed)} CHAT | {len(yellow)} ?", (5, 25),
                         cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+
+            # 桌线可视化 (仅 desk 模式): 绿色直线 = 拟合出的桌线, 用于人工核对
+            if SEAT_MODE == "desk":
+                L0 = max(img_w, img_h) * 0.8
+                if desk_frame.has_lines():
+                    for k, (mx, my, dx, dy, npts, ang) in enumerate(desk_frame.lines):
+                        cv2.line(im0, (int(mx - dx * L0), int(my - dy * L0)),
+                                 (int(mx + dx * L0), int(my + dy * L0)), (0, 255, 0), 1, cv2.LINE_AA)
+                    cv2.putText(im0, f"desk lines: {len(desk_frame.lines)}", (5, 55),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                elif DESK_ANGLE_MANUAL is not None:
+                    t = math.radians(DESK_ANGLE_MANUAL)
+                    ux, uy = math.cos(t), math.sin(t)
+                    cx0, cy0 = img_w / 2.0, img_h / 2.0
+                    cv2.line(im0, (int(cx0 - ux * L0), int(cy0 - uy * L0)),
+                             (int(cx0 + ux * L0), int(cy0 + uy * L0)), (0, 255, 0), 1, cv2.LINE_AA)
+                    cv2.putText(im0, f"desk {DESK_ANGLE_MANUAL:.0f}deg", (5, 55),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                else:
+                    cv2.putText(im0, "desk: waiting (feet pts...)", (5, 55),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
+            elif SEAT_MODE == "depth":
+                cv2.putText(im0, f"seat: depth<={SEAT_DEPTH_RATIO_MAX}", (5, 55),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
 
             annotated = cv2.resize(im0, (out_w, out_h))
             writer.write(annotated)

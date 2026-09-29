@@ -444,7 +444,10 @@ def jepa_predict_pair(encoder, classifier, buf, region, device):
 # ==============================================================================
 if __name__ == '__main__':
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    video_files = sorted(glob.glob(os.path.join(VIDEO_DIR, "*.mp4")))
+    if os.path.isfile(VIDEO_DIR):                       # 指向单个视频文件
+        video_files = [VIDEO_DIR]
+    else:                                               # 指向目录: 处理里面所有 mp4
+        video_files = sorted(glob.glob(os.path.join(VIDEO_DIR, "*.mp4")))
     print(f"[输入] {VIDEO_DIR}\n[输出] {OUTPUT_DIR}\n[视频] {len(video_files)} 个")
     if SMOOTH_ENABLE:
         print(f"[时序] 平滑开: 连续 {SMOOTH_CONFIRM_FRAMES} 个处理帧确认, "

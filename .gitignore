@@ -32,3 +32,6 @@ Thumbs.db
 .DS_Store
 _dataset/track.json
 发布包_站立识别_v1/
+
+# ===== 误解压进来的第三方仓库整包 (与交头接耳项目无关, 别提交) =====
+turnhead/

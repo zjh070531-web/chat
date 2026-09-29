@@ -59,6 +59,7 @@ OUT_DIR = r"D:\chatting\_dataset"
 IMGSZ_DET = 1920             # 检测分辨率(调高, 远景小头也能检出)
 SAMPLE_INTERVAL = 1.0        # 每隔多少秒检一次 (调小 → 收得更密, 但更慢)
 CLIP_DUR = 3.0               # 每个候选 clip 的时长(秒)
+MOVE_THRESH = 0.8            # 走动判据: 与上一采样帧比, 头中心移动 > 该倍数×头高 算"走动"(排除)
 OUT_SIZE = V.PAIR_PREP_SIZE  # 裁剪区统一缩放到的边长(与训练/推理预处理一致)
 MAX_PER_VIDEO = 60           # 每个源视频最多导出多少 clip(全局按可疑度排序后取前 N)
 PRE1_GAZE = 100.0            # 预标 1 的视线夹角阈值(与 v1 一致)
@@ -449,6 +450,7 @@ def main():
         # ---- 第一遍: 只做检测, 把整段视频的"真·邻座"配对全部收下来 ----
         # 不能边跑边占配额: 早期帧的"正常"样本会把配额吃光, 漏掉后面才出现的强可疑。
         cands = []
+        prev_heads = []                       # 上一采样帧的头, 用于"走动"检测
         for fi in range(0, max(1, nframes - clip_len), step):
             cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
             ok, im0 = cap.read()
@@ -459,8 +461,21 @@ def main():
             img = np.ascontiguousarray(img.transpose((2, 0, 1))[::-1])
             heads = detect_heads(img, im0, agent, det_model)
             if len(heads) < 2:
+                prev_heads = []
                 continue
+            # ---- 走动检测: 与上一采样帧比, 头移动超过阈值的是"走动的人", 排除 ----
+            moving = set()
+            if prev_heads:
+                for idx, h in enumerate(heads):
+                    hh = h["bbox"][3] - h["bbox"][1]
+                    best = min((math.hypot(h["cx"] - px, h["cy"] - py)
+                                for (px, py, ph) in prev_heads), default=1e9)
+                    if best > MOVE_THRESH * max(1.0, hh):   # 移动超过阈值 = 走动
+                        moving.add(idx)
+            prev_heads = [(h["cx"], h["cy"], h["bbox"][3] - h["bbox"][1]) for h in heads]
             for (i, j, gaze, toward) in seat_pairs(heads, img_w):
+                if i in moving or j in moving:
+                    continue                              # 有走动的人, 跳过
                 a, b = heads[i], heads[j]
                 hh = ((a["bbox"][3] - a["bbox"][1]) + (b["bbox"][3] - b["bbox"][1])) / 2.0
                 dist = math.hypot(a["cx"] - b["cx"], a["cy"] - b["cy"]) / max(1.0, hh)

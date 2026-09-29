@@ -64,7 +64,7 @@ MAX_PER_VIDEO = 60           # 每个源视频最多导出多少 clip(全局按�
 PRE1_GAZE = 100.0            # 预标 1 的视线夹角阈值(与 v1 一致)
 PRE2_GAZE = 70.0             # 预标 2 的阈值
 MAX_PER_CLASS = 1200         # 每类上限(全局); 设很大 = 基本不截断, 保留自然分布
-SIT_STAND_RATIO = 5.5        # 坐/站判据: 身头比(身体高/头高) >= 该值算"站着"(坐着约 3~4.5, 站着约 6+)
+# (已移除 SIT_STAND_RATIO 坐/站判据: 实测"身头比"是"远近"信号不是"坐站"信号, 纯噪声)
                              #   用于配对优先级: 优先两个都坐着的, 少选"一坐一站"的
 
 DEVICE = V.DEVICE
@@ -370,7 +370,7 @@ def dump_csv(rows, out_dir):
         wr = csv.DictWriter(fh, fieldnames=["clip", "src", "frame", "sec", "pre",
                                             "gaze", "toward", "dist", "head_h",
                                             "x1", "y1", "x2", "y2",
-                                            "ax", "ay", "bx", "by", "ra", "rb", "posture"])
+                                            "ax", "ay", "bx", "by"])
         wr.writeheader()
         wr.writerows(rows)
     return p
@@ -463,19 +463,15 @@ def main():
             for (i, j, gaze, toward) in seat_pairs(heads, img_w):
                 a, b = heads[i], heads[j]
                 hh = ((a["bbox"][3] - a["bbox"][1]) + (b["bbox"][3] - b["bbox"][1])) / 2.0
-                ra = (a["body"][3] - a["body"][1]) / max(1, a["bbox"][3] - a["bbox"][1])
-                rb = (b["body"][3] - b["body"][1]) / max(1, b["bbox"][3] - b["bbox"][1])
-                posture = (1 if ra >= SIT_STAND_RATIO else 0) + (1 if rb >= SIT_STAND_RATIO else 0)
                 dist = math.hypot(a["cx"] - b["cx"], a["cy"] - b["cy"]) / max(1.0, hh)
                 cands.append({
                     "fi": fi, "gaze": gaze, "toward": toward, "hh": hh, "a": a, "b": b,
-                    "pre": prelabel(gaze, toward), "posture": posture, "ra": ra, "rb": rb,
-                    "dist": dist,
+                    "pre": prelabel(gaze, toward), "dist": dist,
                     "mcx": (a["cx"] + b["cx"]) / 2.0, "mcy": (a["cy"] + b["cy"]) / 2.0,
                 })
-        # ---- 全局排序: 先"两个都坐着"(posture=0), 再按"两人头距/头高"从近到远 ----
+        # ---- 全局排序: 按"两人头距/头高"从近到远 ----
         # 交头接耳的关键是"两人坐得近", 视线交汇只是可有可无的信号, 所以按距离近优先
-        cands.sort(key=lambda c: (c["posture"], c["dist"]))
+        cands.sort(key=lambda c: c["dist"])
         print(f"    真·邻座配对 {len(cands)} 个(互相朝向 {sum(1 for c in cands if c['toward'])}) "
               f"→ 按距离近取前 {args.max_per_video} 个")
 
@@ -508,7 +504,6 @@ def main():
                 "x1": box[0], "y1": box[1], "x2": box[2], "y2": box[3],
                 "ax": round(a["cx"], 1), "ay": round(a["cy"], 1),
                 "bx": round(b["cx"], 1), "by": round(b["cy"], 1),
-                "ra": round(c["ra"], 2), "rb": round(c["rb"], 2), "posture": c["posture"],
             })
             recent.append((fi, c["mcx"], c["mcy"]))
             counts[pre] += 1

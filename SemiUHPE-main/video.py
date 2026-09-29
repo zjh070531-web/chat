@@ -446,6 +446,92 @@ def jepa_predict_pair(encoder, classifier, buf, region, device):
 
 
 # ==============================================================================
+# 视频写出 (H.264 via ffmpeg libx264; 无 ffmpeg 时回落 cv2 mp4v)
+# ==============================================================================
+def _find_ffmpeg():
+    """找到一个带 libx264 的 ffmpeg; 找不到返回 None"""
+    import shutil
+    import subprocess
+    cands = [
+        r"D:\ffmpeg\ffmpeg-2026-09-07-git-ecc7eb519e-essentials_build\bin\ffmpeg.EXE",
+        r"D:\ffmpeg\bin\ffmpeg.exe",
+        "ffmpeg",
+    ]
+    try:
+        import imageio_ffmpeg
+        cands.append(imageio_ffmpeg.get_ffmpeg_exe())
+    except Exception:
+        pass
+    seen = set()
+    for c in cands:
+        if not c or c in seen:
+            continue
+        seen.add(c)
+        p = c if os.path.isfile(c) else shutil.which(c)
+        if not p:
+            continue
+        try:
+            r = subprocess.run([p, "-hide_banner", "-encoders"],
+                               capture_output=True, text=True, errors="replace", timeout=30)
+            if "libx264" in (r.stdout or ""):
+                return p
+        except Exception:
+            continue
+    return None
+
+
+class H264Writer:
+    """把 BGR 帧流式写入 ffmpeg(libx264) → H.264 mp4; 接口对齐 cv2.VideoWriter。"""
+    def __init__(self, out_path, size, fps, crf=20):
+        import subprocess
+        self.out_path = out_path
+        self.fps = fps
+        self.proc = None
+        self.cv = None
+        ffmpeg = _find_ffmpeg()
+        if ffmpeg:
+            cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                   "-f", "rawvideo", "-pix_fmt", "bgr24",
+                   "-s", "%dx%d" % (size[0], size[1]), "-r", "%.6f" % float(fps), "-i", "-",
+                   "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf),
+                   "-pix_fmt", "yuv420p", "-movflags", "+faststart", out_path]
+            self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            print("[写出] ffmpeg(libx264) → H.264")
+        else:
+            self.cv = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, size)
+            print("[写出] 无 ffmpeg, 回落 cv2 mp4v")
+
+    def isOpened(self):
+        return self.proc is not None or (self.cv is not None and self.cv.isOpened())
+
+    def write(self, frame):
+        if self.proc is not None:
+            try:
+                self.proc.stdin.write(np.ascontiguousarray(frame).tobytes())
+            except Exception:
+                pass
+        elif self.cv is not None:
+            self.cv.write(frame)
+
+    def release(self):
+        ok = True
+        if self.proc is not None:
+            try:
+                self.proc.stdin.close()
+                self.proc.wait(timeout=300)
+                if self.proc.returncode != 0:
+                    ok = False
+            except Exception:
+                ok = False
+        if self.cv is not None:
+            self.cv.release()
+        if not ok or not os.path.exists(self.out_path) or os.path.getsize(self.out_path) <= 0:
+            return False
+        return True
+
+
+# ==============================================================================
 # 主流程
 # ==============================================================================
 if __name__ == '__main__':
@@ -517,12 +603,9 @@ if __name__ == '__main__':
         h0 = int(dataset.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         out_w = int(SAVE_HEIGHT * w0 / h0)
         out_h = SAVE_HEIGHT
-        writer, out_path = None, os.path.join(OUTPUT_DIR, name + "_chat.mp4")
-        for codec in ['avc1', 'mp4v', 'XVID']:
-            writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*codec), fps, (out_w, out_h))
-            if writer.isOpened():
-                break
-        if writer is None or not writer.isOpened():
+        out_path = os.path.join(OUTPUT_DIR, name + "_chat.mp4")
+        writer = H264Writer(out_path, (out_w, out_h), fps)
+        if not writer.isOpened():
             print("!! 无法创建输出视频, 跳过"); continue
 
         # 时序平滑状态 + JEPA 缓冲 (每个视频重置)

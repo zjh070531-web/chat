@@ -58,6 +58,7 @@ except ImportError:
 
 # ---------------- 默认配置 ----------------
 SRC_DIRS = [
+    r"D:\video\1\教室前中-左",               # 教室前中_左 (近镜头, 头更大更清晰) — 用户指定新增
     r"D:\video\1\1\right\cutting_video",
     r"D:\video\1\1\right\cutting_video2",
     r"D:\video\1\1\right\cutting_video3",
@@ -75,6 +76,7 @@ MAX_PER_VIDEO = 60           # 每个源视频最多导出多少 clip(全局按�
 PRE1_GAZE = 100.0            # 预标 1 的视线夹角阈值(与 v1 一致)
 PRE2_GAZE = 70.0             # 预标 2 的阈值
 MAX_PER_CLASS = 1200         # 每类上限(全局); 设很大 = 基本不截断, 保留自然分布
+PAIR_MAX = 4                 # 同一对(按头中心就近认领)最多导出几个 clip; 防同一对把配额堆满
 # (已移除 SIT_STAND_RATIO 坐/站判据: 实测"身头比"是"远近"信号不是"坐站"信号, 纯噪声)
                              #   用于配对优先级: 优先两个都坐着的, 少选"一坐一站"的
 
@@ -394,6 +396,49 @@ def write_clip(cap, start_frame, box, fps, out_path, size=OUT_SIZE):
     return got
 
 
+def extract_clips_seq(cap, clips, fps, out_size=OUT_SIZE):
+    """按 fi 升序顺序读帧、滚动缓冲取 clip(不 seek, 避免 4K H.264 反复解码 GOP);
+    clips: [(fi, box, cpath)]; 返回成功写出的 cpath 列表"""
+    from collections import deque
+    need = max(1, int(round(CLIP_DUR * fps)))
+    clips = sorted(clips, key=lambda t: t[0])
+    buf = deque()                          # [(frame_idx, BGR frame)], 只保留 >= 当前 fi 的帧
+    pos = 0
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    written = []
+    for fi, box, cpath in clips:
+        x1, y1, x2, y2 = box
+        if x2 - x1 < 8 or y2 - y1 < 8:
+            continue
+        end = fi + need - 1
+        while buf and buf[0][0] < fi:       # 丢掉早于当前 fi 的旧帧
+            buf.popleft()
+        while pos <= end:                   # 顺序补读到 end
+            if pos < fi:                    # 非裁剪区只 grab(解码不拷贝), 跳过更快
+                ok = cap.grab()
+            else:
+                ok, f = cap.read()
+                if ok:
+                    buf.append((pos, f))
+            if not ok:
+                break
+            pos += 1
+        if len(buf) < need * 0.6:           # 帧数不足(临近片尾), 丢弃
+            continue
+        frames = [f for _idx, f in buf][:need]
+        cropped = [cv2.resize(f[y1:y2, x1:x2], (out_size, out_size),
+                              interpolation=cv2.INTER_AREA) for f in frames]
+        got = encode_h264(cropped, cpath, out_size, fps)
+        if got >= need * 0.6:
+            written.append(cpath)
+        else:
+            try:
+                os.remove(cpath)
+            except OSError:
+                pass
+    return written
+
+
 def list_videos(dirs):
     exts = (".mp4", ".avi", ".mov", ".mkv", ".ts", ".flv", ".wmv")
     out = []
@@ -496,56 +541,85 @@ def main():
         # ---- 第一遍: 只做检测, 把整段视频的"真·邻座"配对全部收下来 ----
         # 不能边跑边占配额: 早期帧的"正常"样本会把配额吃光, 漏掉后面才出现的强可疑。
         cands = []
-        for fi in range(0, max(1, nframes - clip_len), step):
-            cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
+        img_w = img_h = None
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        fi = 0
+        while True:                          # 顺序扫一遍(不 seek), 每隔 step 帧检测一次
             ok, im0 = cap.read()
             if not ok:
-                continue
-            img_h, img_w = im0.shape[:2]
-            img = letterbox(im0, args.imgsz, stride=STRIDE, auto=True)[0]
-            img = np.ascontiguousarray(img.transpose((2, 0, 1))[::-1])
-            heads = detect_heads(img, im0, agent, det_model)
-            if len(heads) < 2:
-                continue
-            # ---- 站立检测: 用用户的 classify_pose 判出"站立"的人, 其框内的人头都排除 ----
-            stand_boxes = detect_standing_boxes(im0)
-            for (i, j, gaze, toward) in seat_pairs(heads, img_w):
-                a, b = heads[i], heads[j]
-                if _head_in_stand(a, stand_boxes) or _head_in_stand(b, stand_boxes):
-                    continue                              # 有站立的人, 跳过(只留两个都坐着的)
-                hh = ((a["bbox"][3] - a["bbox"][1]) + (b["bbox"][3] - b["bbox"][1])) / 2.0
-                dist = math.hypot(a["cx"] - b["cx"], a["cy"] - b["cy"]) / max(1.0, hh)
-                cands.append({
-                    "fi": fi, "gaze": gaze, "toward": toward, "hh": hh, "a": a, "b": b,
-                    "pre": prelabel(gaze, toward), "dist": dist,
-                    "mcx": (a["cx"] + b["cx"]) / 2.0, "mcy": (a["cy"] + b["cy"]) / 2.0,
-                })
-        # ---- 全局排序: 按"两人头距/头高"从近到远 ----
-        # 交头接耳的关键是"两人坐得近", 视线交汇只是可有可无的信号, 所以按距离近优先
-        cands.sort(key=lambda c: c["dist"])
+                break
+            if fi % step == 0 and fi <= nframes - clip_len:
+                img_h, img_w = im0.shape[:2]
+                img = letterbox(im0, args.imgsz, stride=STRIDE, auto=True)[0]
+                img = np.ascontiguousarray(img.transpose((2, 0, 1))[::-1])
+                heads = detect_heads(img, im0, agent, det_model)
+                if len(heads) >= 2:
+                    # ---- 站立检测: 用用户的 classify_pose 判出"站立"的人, 其框内的人头都排除 ----
+                    stand_boxes = detect_standing_boxes(im0)
+                    for (i, j, gaze, toward) in seat_pairs(heads, img_w):
+                        a, b = heads[i], heads[j]
+                        if _head_in_stand(a, stand_boxes) or _head_in_stand(b, stand_boxes):
+                            continue                          # 有站立的人, 跳过(只留两个都坐着的)
+                        hh = ((a["bbox"][3] - a["bbox"][1]) + (b["bbox"][3] - b["bbox"][1])) / 2.0
+                        dist = math.hypot(a["cx"] - b["cx"], a["cy"] - b["cy"]) / max(1.0, hh)
+                        cands.append({
+                            "fi": fi, "gaze": gaze, "toward": toward, "hh": hh, "a": a, "b": b,
+                            "pre": prelabel(gaze, toward), "dist": dist,
+                            "mcx": (a["cx"] + b["cx"]) / 2.0, "mcy": (a["cy"] + b["cy"]) / 2.0,
+                        })
+            fi += 1
+        # ---- 全局排序: 优先"离镜头近"(头更大→更清晰), 其次两人挨得近 ----
+        cands.sort(key=lambda c: (-c["hh"], c["dist"]))
         print(f"    真·邻座配对 {len(cands)} 个(互相朝向 {sum(1 for c in cands if c['toward'])}) "
-              f"→ 按距离近取前 {args.max_per_video} 个")
+              f"→ 离镜头近(头大)优先, 取前 {args.max_per_video} 个")
 
-        # ---- 第二遍: 回放取 clip (write_clip 自己 seek, 与循环位置无关) ----
+        # ---- 第二遍: 先纯内存选点(排序+去重+每对上限), 再顺序扫一遍取 clip(不 seek) ----
+        picked = []                          # [(fi, box, cpath, cand)]
         recent = []                          # [(fi, cx, cy)] 相邻采样点去重
+        pair_cnt = {}                        # 同一对(按头中心就近认领)的导出计数
         for c in cands:
-            if made >= args.max_per_video:
+            if len(picked) >= args.max_per_video:
                 break
             pre = c["pre"]
             if counts[pre] >= MAX_PER_CLASS:
                 continue
             fi, hh = c["fi"], c["hh"]
+            a, b = c["a"], c["b"]
             if any(abs(fi - pf) < step * 1.5
                    and math.hypot(c["mcx"] - px, c["mcy"] - py) < 1.5 * hh
                    for pf, px, py in recent):
                 continue                     # 同一对刚采过, 跳过
-            a, b = c["a"], c["b"]
+            pid = None
+            for k in pair_cnt:
+                if max(abs(a["cx"] - k[0]), abs(a["cy"] - k[1]),
+                       abs(b["cx"] - k[2]), abs(b["cy"] - k[3])) < hh:
+                    pid = k
+                    break
+            if pid is None:
+                pid = (a["cx"], a["cy"], b["cx"], b["cy"])
+                pair_cnt[pid] = 0
+            if pair_cnt[pid] >= PAIR_MAX:
+                continue                     # 这一对已经采够了, 换下一对
             box = make_box(a, b, img_w, img_h)
             seq += 1
             cid = f"{stem}_f{fi:05d}_{seq:04d}"
             cpath = os.path.join(clips_dir, cid + ".mp4")
-            if os.path.exists(cpath) or write_clip(cap, fi, box, fps, cpath) == 0:
+            if os.path.exists(cpath):
                 continue
+            pair_cnt[pid] += 1
+            recent.append((fi, c["mcx"], c["mcy"]))
+            picked.append((fi, box, cpath, c))
+        # 顺序取 clip(按 fi 升序, 滚动缓冲, 不 seek)
+        written = extract_clips_seq(cap, [(p[0], p[1], p[2]) for p in picked], fps)
+        written_set = set(written)
+        cap.release()
+        # 只为成功写出的 clip 建 rows(与旧逻辑一致: 写成功才登记)
+        for fi, box, cpath, c in picked:
+            if cpath not in written_set:
+                continue
+            a, b = c["a"], c["b"]
+            pre = c["pre"]
+            hh = c["hh"]
             d = math.hypot(a["cx"] - b["cx"], a["cy"] - b["cy"])
             rows.append({
                 "clip": os.path.relpath(cpath, args.out), "src": vpath,
@@ -556,10 +630,8 @@ def main():
                 "ax": round(a["cx"], 1), "ay": round(a["cy"], 1),
                 "bx": round(b["cx"], 1), "by": round(b["cy"], 1),
             })
-            recent.append((fi, c["mcx"], c["mcy"]))
             counts[pre] += 1
             made += 1
-        cap.release()
         print(f"    导出 {made} 个; 累计 正常{counts[0]} / 强可疑{counts[1]} / 待定{counts[2]}")
         dump_csv(rows, args.out)        # 每处理完一个视频就落盘, 方便边采边标
 

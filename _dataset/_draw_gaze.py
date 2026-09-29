@@ -68,7 +68,11 @@ for k, rb in enumerate(crops):
     ang = SP.V.Rotation.from_matrix(rm).as_euler("xyz", degrees=True)
     roll, pitch, yaw = list(map(SP.V.limit_angle, [ang[2], ang[0] - 180, ang[1]]))
     ya = SP.V.YAW_SIGN * yaw
-    fwd = rm @ np.array([0.0, 0.0, 1.0])   # 面部朝前向量(相机系: x右 y下 z向前)
+    # 面部朝前向量(相机系: x右 y下 z朝画面内)
+    # ★注意: euler 提取用了 ang[0]-180 (绕 x 轴 180° 翻转的约定), 该翻转不改 x 分量,
+    #   但会让 y/z 反向 —— 所以这里必须把 y/z 取反, 否则箭头水平对、垂直反
+    fwd = rm @ np.array([0.0, 0.0, 1.0])
+    fwd = np.array([fwd[0], -fwd[1], -fwd[2]])
     heads.append({"cx": (rb[0] + rb[2]) / 2.0, "cy": (rb[1] + rb[3]) / 2.0,
                   "bbox": rb, "ya": ya, "pitch": pitch, "fwd": fwd,
                   "hh": rb[3] - rb[1]})
@@ -122,7 +126,8 @@ if len(order) >= 2:
     cv2.line(vis, (int(a["cx"]), int(a["cy"])), (int(b["cx"]), int(b["cy"])),
              (255, 255, 255), 1, cv2.LINE_AA)
     ok = gaze >= SP.V.GAZE_OBTUSE_THRESH
-    label = f"夹角 {gaze:.1f}° ({'≥100° 达标' if ok else '<100° 不达标'})"
+    thr = SP.V.GAZE_OBTUSE_THRESH
+    label = f"夹角 {gaze:.1f}° ({'≥%.0f° 达标' % thr if ok else '<%.0f° 不达标' % thr})"
     vis = draw_cn(vis, (int(mx) + 8, int(my) + 8), label, 22,
                   (0, 255, 0) if ok else (0, 0, 255))
     print(f"主对 P{i}-P{j}: 夹角 {gaze:.1f}° (阈值 {SP.V.GAZE_OBTUSE_THRESH}°)")

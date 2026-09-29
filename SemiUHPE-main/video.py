@@ -876,7 +876,7 @@ if __name__ == '__main__':
                     print(f"[3D人脸] 渲染失败: {e}")
 
             # ===== 4. 桌子坐标系: 累积脚点 → 周期性拟合桌线 =====
-            desk.update(heads)
+            desk_frame.update(heads)
 
             # ===== 5. 判定: 座位约束(桌子坐标) + 视线夹角钝角 → 一对一匹配 =====
             raw_pairs = one_to_one(judge_pairs(heads, desk_frame))

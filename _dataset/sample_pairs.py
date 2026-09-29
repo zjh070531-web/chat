@@ -40,6 +40,17 @@ if PY_ROOT not in sys.path:
 
 import video as V   # 复用 BPJDet 后处理 / 判定常量
 
+# ---- 站立识别: 复用用户的发布包(只 import, 绝不修改该目录), 用 classify_pose 判站立 ----
+STAND_DIR = r"D:\chatting\发布包_站立识别_v1\01_算法与模型"
+if STAND_DIR not in sys.path:
+    sys.path.insert(0, STAND_DIR)
+import stand_detector as SD  # noqa: E402
+STAND_MODEL_PATH = r"D:\deeplearning\ultralytics-8.3.163\yolo11n-pose.pt"
+STAND_IMGSZ = 640
+STAND_KCONF = 0.35
+STAND_THRESH = 0.60
+POSE_MODEL = None
+
 try:
     from utils.augmentations import letterbox
 except ImportError:
@@ -101,6 +112,41 @@ def load_models(imgsz=IMGSZ_DET):
     det_model = det_model.half()
     print(f"[模型] BPJDet(imgsz={IMGSZ_CHK}) + SemiUHPE 已加载")
     return agent, det_model
+
+
+def load_pose_model():
+    """加载用户指定的 YOLO 姿态模型, 用于站立识别(复用用户发布包的 classify_pose 规则)。"""
+    global POSE_MODEL
+    from ultralytics import YOLO
+    POSE_MODEL = YOLO(STAND_MODEL_PATH)
+    print("[模型] 站立识别 YOLO-Pose 已加载")
+    return POSE_MODEL
+
+
+def detect_standing_boxes(im0):
+    """返回该帧里被 classify_pose 判为"站立"的人体框列表 [(x1,y1,x2,y2), ...]。"""
+    if POSE_MODEL is None:
+        return []
+    r = POSE_MODEL(im0, imgsz=STAND_IMGSZ, verbose=False)[0]
+    boxes = []
+    if r.boxes is None or getattr(r, "keypoints", None) is None:
+        return boxes
+    kpts = r.keypoints.data.cpu().numpy()   # (N, 17, 3)
+    bxs = r.boxes.xyxy.cpu().numpy()        # (N, 4)
+    for kp, bx in zip(kpts, bxs):
+        res = SD.classify_pose(kp, bx, kconf=STAND_KCONF, stand_threshold=STAND_THRESH)
+        if res.label == SD.STANDING:
+            boxes.append(tuple(float(v) for v in bx))
+    return boxes
+
+
+def _head_in_stand(h, stand_boxes):
+    """头中心是否落在某个"站立"人体框内。"""
+    cx, cy = h["cx"], h["cy"]
+    for (x1, y1, x2, y2) in stand_boxes:
+        if x1 <= cx <= x2 and y1 <= cy <= y2:
+            return True
+    return False
 
 
 # ==============================================================================
@@ -425,6 +471,7 @@ def main():
         print(f"[续采] 已有 {len(rows)} 条候选, seq 从 {seq} 继续")
 
     agent, det_model = load_models(args.imgsz)
+    load_pose_model()
 
     for vi, vpath in enumerate(videos, 1):
         if os.path.normcase(os.path.abspath(vpath)) in done_srcs:
@@ -463,6 +510,8 @@ def main():
             if len(heads) < 2:
                 prev_heads = []
                 continue
+            # ---- 站立检测: 用用户的 classify_pose 判出"站立"的人, 其框内的人头都排除 ----
+            stand_boxes = detect_standing_boxes(im0)
             # ---- 走动检测: 与上一采样帧比, 头移动超过阈值的是"走动的人", 排除 ----
             moving = set()
             if prev_heads:
@@ -477,6 +526,8 @@ def main():
                 if i in moving or j in moving:
                     continue                              # 有走动的人, 跳过
                 a, b = heads[i], heads[j]
+                if _head_in_stand(a, stand_boxes) or _head_in_stand(b, stand_boxes):
+                    continue                              # 有站立的人, 跳过(只留两个都坐着的)
                 hh = ((a["bbox"][3] - a["bbox"][1]) + (b["bbox"][3] - b["bbox"][1])) / 2.0
                 dist = math.hypot(a["cx"] - b["cx"], a["cy"] - b["cy"]) / max(1.0, hh)
                 cands.append({

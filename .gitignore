@@ -31,3 +31,4 @@ __pycache__/
 Thumbs.db
 .DS_Store
 _dataset/track.json
+发布包_站立识别_v1/

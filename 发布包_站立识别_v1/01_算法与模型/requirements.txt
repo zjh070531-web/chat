@@ -1,9 +1,0 @@
-# 站立识别依赖（本机已验证版本见括号）
-ultralytics>=8.3.0        # 8.4.98：YOLO26 姿态模型 + ByteTrack 跟踪
-torch>=2.2.0              # 2.11.0+cu128（GPU 推理）
-torchvision>=0.17.0       # 0.26.0+cu128
-opencv-python>=4.8.0      # 4.13.0：视频读写与绘制
-numpy>=1.24               # 2.4.4
-pillow>=10.0              # 12.2.0：中文字体渲染
-imageio-ffmpeg>=0.4.9     # 0.6.0：H.264 编码 + 原音轨复用
-lap>=0.5.12               # 0.5.13：ByteTrack 匈牙利匹配

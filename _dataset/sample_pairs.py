@@ -45,7 +45,7 @@ STAND_DIR = r"D:\chatting\发布包_站立识别_v1\01_算法与模型"
 if STAND_DIR not in sys.path:
     sys.path.insert(0, STAND_DIR)
 import stand_detector as SD  # noqa: E402
-STAND_MODEL_PATH = r"D:\deeplearning\ultralytics-8.3.163\yolo11n-pose.pt"
+STAND_MODEL_PATH = os.path.join(STAND_DIR, "yolo26s-pose.pt")
 STAND_IMGSZ = 640
 STAND_KCONF = 0.35
 STAND_THRESH = 0.60

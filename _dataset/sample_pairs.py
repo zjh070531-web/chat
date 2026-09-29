@@ -248,21 +248,18 @@ def seat_pairs(heads, img_w):
             if h_a <= 0 or h_b <= 0:
                 continue
             ref_head = (h_a + h_b) * 0.5
-            dx = abs(a["cx"] - b["cx"])
-            dy = abs(a["cy"] - b["cy"])
-            if dy > V.ROW_Y_RATIO * ref_head:
+            # 同桌判据 (与 video.py 的 SEAT_MODE="depth" 完全一致):
+            #   同深度(头一样大) + 距离近 —— 与摄像头斜不斜、桌子怎么摆都无关
+            if max(h_a, h_b) / min(h_a, h_b) > V.SEAT_DEPTH_RATIO_MAX:   # 深度不同 = 前后排/隔桌
                 continue
-            if max(h_a, h_b) / min(h_a, h_b) > V.HEAD_SIZE_RATIO_MAX:   # 深度不同(前后排)
-                continue
-            if dx > V.NEAR_DX_RATIO * ref_head:     # ★真·邻座: 头距 ≤ 3 倍平均头高
-                continue
-            if dx < dy * V.NEIGHBOR_DX_RATIO:
-                continue
+            if math.hypot(a["cx"] - b["cx"], a["cy"] - b["cy"]) > V.SEAT_DIST_RATIO * ref_head:
+                continue                                                 # 隔太远, 不是邻座
 
             ya, yb = V.YAW_SIGN * a["yaw"], V.YAW_SIGN * b["yaw"]
             a_on_left = a["cx"] < b["cx"]
-            a_toward = (ya < 0) if a_on_left else (ya > 0)
-            b_toward = (yb > 0) if a_on_left else (yb < 0)
+            # ★符号(2026-09-29 实测核实): ya>0=朝图像【右】, ya<0=朝图像【左】
+            a_toward = (ya > 0) if a_on_left else (ya < 0)
+            b_toward = (yb < 0) if a_on_left else (yb > 0)
             gaze = abs(ya - yb)
             if gaze > 180.0:
                 gaze = 360.0 - gaze

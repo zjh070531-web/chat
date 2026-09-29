@@ -104,40 +104,31 @@ MIN_BODY_WIDTH = 30          # 最小身体宽度(像素)
 BH_RATIO_MIN, BH_RATIO_MAX = 2.5, 8.0   # 身体高/头高 的合理范围
 HEAD_MIN_RATIO, HEAD_MAX_RATIO = 0.015, 0.35   # 头宽占图宽的比例范围
 
-# ---- ① 座位约束 (三种判据, SEAT_MODE 二选一) ----
-# 旧判据("image")的问题: 摄像头是斜俯视角, 图像里的"上下"≠教室里的"前后",
-# 同一张桌子的相邻两人在画面里是斜着排列的, 按图像 dx/dy 判同排会把他们误判成"前后排"。
-SEAT_MODE = "depth"          # ★"depth"=同深度判同桌(推荐, 与摄像头视角无关)
-                             #      "desk" =桌线法(规则教室, 跨帧累积脚点拟合桌线)
-                             #      "image"=旧版图像坐标判定 (仅作对照)
+# ---- ① 座位约束: 以"桌子"为坐标系判相邻 (2026-09-29) ----
+# 已废弃旧的图像坐标判据 (ROW_Y_RATIO/NEAR_DX_RATIO/NEIGHBOR_DX_RATIO: 按画面里的上下左右
+# 判"同排/邻座"): 摄像头是斜俯视角, 画面里的"上下"≠教室里的"前后", 同一张桌子的相邻两人
+# 在画面里是斜着排列的, 会被误判成"前后排"而漏检。现在只按桌子(深度)来判。
+SEAT_MODE = "depth"          # ★"depth"=同深度即同桌(推荐, 与摄像头视角无关)
+                             #   "desk" =桌线法(规则教室: 跨帧累积脚点拟合桌线, 两人同线才算同桌)
 SEAT_DEPTH_RATIO_MAX = 1.20  # ★[depth] 同深度=同桌: 两人头高比 ≤ 该值
-                             #   同桌相邻的人离镜头距离一样 → 头一样大(比值≈1.0~1.1);
+                             #   同桌相邻的人离镜头一样远 → 头一样大(比值≈1.0~1.1);
                              #   前后排的人深度差明显 → 头大小差得更多(实测 ≥1.2)。
-                             #   这是"同排"最稳的判据: 与摄像头斜不斜、桌子怎么摆都无关。
+                             #   头的大小就是深度, 与摄像头斜不斜、桌子怎么摆都无关。
 SEAT_DIST_RATIO = 3.0        # ★邻座: 两人距离 ≤ 该倍数×平均头高 (尺度无关!)
                              #   肩并肩坐着的人头距 ≈ 肩宽 ≈ 2 倍头高, 故 3.0 留了一点余量。
-HEAD_SIZE_RATIO_MAX = 1.5    # 头高比上限 (desk/image 模式的深度兜底; depth 模式用上面的
-                             #   SEAT_DEPTH_RATIO_MAX, 更严)
-ROW_Y_RATIO = 0.6            # [image 模式] 同排: 两头中心图像高度差 ≤ 该倍数×平均头高
-NEAR_DX_RATIO = 3.0          # [image 模式] 邻座: 两头水平距离 ≤ 该倍数×平均头高
-NEIGHBOR_DX_RATIO = 0.5      # [image 模式] 左右相邻: 水平距离 ≥ 垂直距离×该比例
-DESK_FRAME_ENABLE = SEAT_MODE == "desk"   # 向下兼容: desk 模式才启用桌线法
+HEAD_SIZE_RATIO_MAX = 1.5    # [desk 模式] 头高比上限(深度兜底); depth 模式用上面更严的
+                             #   SEAT_DEPTH_RATIO_MAX。desk 模式在桌线还没拟合出来时也用它。
 
-# ---- ① 座位约束: 桌子坐标系 (2026-09-29 新增, 推荐) ----
-# 原理: 人坐着不动, 把整段视频里所有人的"脚点"(身体框底部中心 ≈ 椅子位置, 接近地面)
-#       累积起来 RANSAC 拟合桌线 —— 真实桌线会有大量支持点, 巧合共线是零星的。
-#       判定两人: 是否存在一条桌线同时经过两人的脚点(垂直偏移 ≤ 阈值),
-#       且两人沿这条桌线的距离 ≤ 邻座上限 —— 即"同一张桌子的左右邻座"。
-#       前后排/隔桌/过道对面的人不在同一条桌线上, 直接排除。
-#       这样判的是"桌子坐标系", 与摄像头是斜俯视还是正俯视无关。
-DESK_FRAME_ENABLE = True     # ★True=用桌子坐标系; False=退回旧版图像坐标判定
-DESK_ANGLE_MANUAL = None     # 手动指定桌子方向角(度, 图像x轴起算); None=自动拟合桌线
-                             #   自动拟合失败的场景(人太少/桌线不规则)可用它手动兜底
-DESK_ROW_RATIO = 0.9         # ★同排: 脚点到桌线的垂直偏移 ≤ 该倍数×平均头高
-DESK_NEAR_RATIO = 3.0        # ★邻座: 同一桌线上两人沿桌距离 ≤ 该倍数×平均头高
+# ---- ① 座位约束: 桌线法参数 (仅 SEAT_MODE="desk" 时生效) ----
+# 人坐着不动 → 把整段视频所有人的"脚点"(身体框底部中心 ≈ 椅子位置, 接近地面)累积起来
+# RANSAC 拟合桌线: 真实桌线支持点多, 巧合共线是零星的。判定两人是否同桌: 是否存在一条
+# 桌线同时经过两人脚点(垂直偏移 ≤ 阈值), 且沿桌距离 ≤ 邻座上限。
+DESK_ANGLE_MANUAL = None     # 手动指定桌向角(度, 图像x轴起算); None=自动拟合桌线
+DESK_ROW_RATIO = 0.9         # 脚点到桌线的垂直偏移 ≤ 该倍数×平均头高
+DESK_NEAR_RATIO = 3.0        # 同一桌线上两人沿桌距离 ≤ 该倍数×平均头高
 DESK_LINE_INLIER = 0.8       # 拟合桌线时的内点距离 (×中位头高)
 DESK_MIN_LINE_PTS = 40       # 一条桌线至少要积累的脚点数 (过滤巧合共线)
-DESK_MIN_FEET = 60           # 脚点总数少于该值时退回旧版图像坐标判定 (视频开头)
+DESK_MIN_FEET = 60           # 脚点总数少于该值时暂用 depth 判据兜底 (视频开头)
 DESK_POINTS_MAX = 4000       # 脚点缓冲上限 (滚动覆盖)
 DESK_REEST_INTERVAL = 30     # 每隔多少个处理帧重新拟合一次桌线
 DESK_MAX_LINES = 4           # 最多拟合几条桌线 (房间里有几排桌子)
@@ -294,8 +285,21 @@ class DeskFrame:
 
 
 # ==============================================================================
-# 配对判定: 座位约束(桌子坐标系) + 视线夹角钝角
+# 配对判定: 座位约束(桌子坐标系: 同深度即同桌 / 桌线法) + 视线夹角钝角
 # ==============================================================================
+def _too_far_or_diff_depth(a, b, ref_head):
+    """同桌相邻判据: 同深度(头一样大) + 距离近。两者都是尺度无关的。"""
+    h_a = a['bbox'][3] - a['bbox'][1]
+    h_b = b['bbox'][3] - b['bbox'][1]
+    if h_a <= 0 or h_b <= 0:
+        return True
+    if max(h_a, h_b) / min(h_a, h_b) > SEAT_DEPTH_RATIO_MAX:      # 深度不同 = 前后排/隔桌
+        return True
+    if math.hypot(a['cx'] - b['cx'], a['cy'] - b['cy']) > SEAT_DIST_RATIO * ref_head:
+        return True                                               # 隔太远, 不是邻座
+    return False
+
+
 def judge_pairs(heads, desk):
     """heads: [{cx,cy,bbox,body,yaw,...}]; desk: DeskFrame
     返回通过判定的配对列表 [(i, j, 夹角)]"""
@@ -312,14 +316,7 @@ def judge_pairs(heads, desk):
                 continue
             ref_head = (h_a + h_b) * 0.5
 
-            if SEAT_MODE == "depth":
-                # ---- 同深度 = 同排/同桌: 头的大小就是深度, 与摄像头视角无关 ----
-                if max(h_a, h_b) / min(h_a, h_b) > SEAT_DEPTH_RATIO_MAX:
-                    continue                             # 深度不同 = 前后排/隔桌
-                if math.hypot(a['cx'] - b['cx'], a['cy'] - b['cy']) > SEAT_DIST_RATIO * ref_head:
-                    continue                             # 隔太远, 不是邻座
-
-            elif SEAT_MODE == "desk":
+            if SEAT_MODE == "desk":
                 # ---- 桌线法: 两人脚点必须同在一条拟合出的桌线上 ----
                 if max(h_a, h_b) / min(h_a, h_b) > HEAD_SIZE_RATIO_MAX:   # 深度兜底
                     continue
@@ -338,24 +335,12 @@ def judge_pairs(heads, desk):
                     if not desk.same_desk(ga, gb, ref_head):
                         continue
                 else:
-                    # 桌线还没拟合出来: 退回旧版图像坐标判据
-                    dx = abs(a['cx'] - b['cx'])
-                    dy = abs(a['cy'] - b['cy'])
-                    if dy > ROW_Y_RATIO * ref_head or dx > NEAR_DX_RATIO * ref_head \
-                            or dx < dy * NEIGHBOR_DX_RATIO:
+                    # 桌线还没拟合出来(视频开头/人太少): 用同深度判据兜底
+                    if _too_far_or_diff_depth(a, b, ref_head):
                         continue
-
             else:
-                # ---- 旧版: 图像坐标判定 (摄像头视角) ----
-                if max(h_a, h_b) / min(h_a, h_b) > HEAD_SIZE_RATIO_MAX:
-                    continue
-                dx = abs(a['cx'] - b['cx'])
-                dy = abs(a['cy'] - b['cy'])
-                if dy > ROW_Y_RATIO * ref_head:          # 不在同一排 (前后排)
-                    continue
-                if dx > NEAR_DX_RATIO * ref_head:        # 两人隔太远, 不是邻座
-                    continue
-                if dx < dy * NEIGHBOR_DX_RATIO:          # 偏前后而不是左右
+                # ---- 同深度 = 同排/同桌: 头的大小就是深度, 与摄像头视角无关 ----
+                if _too_far_or_diff_depth(a, b, ref_head):
                     continue
 
             # ---------- ② 视线夹角 (钝角 = 相互对看) ----------

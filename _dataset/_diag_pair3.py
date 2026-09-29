@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """诊断3: 跳过预过滤, 对原始检出的每个头跑头姿, 再做 7 步配对判定"""
-import sys, os
+import sys, os, math
 sys.stdout.reconfigure(encoding="utf-8")
 sys.path.insert(0, r"D:\chatting\_dataset")
 import cv2
@@ -80,24 +80,24 @@ for i in range(n):
         szr = max(h_a, h_b) / min(h_a, h_b)
         ya = V.YAW_SIGN * a["yaw"]; yb = V.YAW_SIGN * b["yaw"]
         a_on_left = a["cx"] < b["cx"]
-        a_toward = (ya < 0) if a_on_left else (ya > 0)
-        b_toward = (yb > 0) if a_on_left else (yb < 0)
+        a_toward = (ya > 0) if a_on_left else (ya < 0)   # 2026-09-29 实测符号修正
+        b_toward = (yb < 0) if a_on_left else (yb > 0)
         gaze = abs(ya - yb)
         if gaze > 180.0:
             gaze = 360.0 - gaze
         turned = abs(ya) >= V.MIN_TURN_YAW and abs(yb) >= V.MIN_TURN_YAW
-        ok_seat = dy <= V.ROW_Y_RATIO * ref
-        ok_depth = szr <= V.HEAD_SIZE_RATIO_MAX
-        ok_near = dx <= V.NEAR_DX_RATIO * ref
-        ok_lr = dx >= dy * V.NEIGHBOR_DX_RATIO
+        ok_seat = szr <= V.SEAT_DEPTH_RATIO_MAX          # ①同深度=同桌(头一样大)
+        ok_depth = True
+        ok_near = math.hypot(dx, dy) <= V.SEAT_DIST_RATIO * ref   # ②邻座距离
+        ok_lr = True
         ok_turn = turned
         ok_toward = a_toward and b_toward
         ok_gaze = gaze >= V.GAZE_OBTUSE_THRESH
         print(f"\n=== 配对 ({i},{j}) ===")
-        print(f"  ①同排    dy={dy:.0f} ≤ {V.ROW_Y_RATIO * ref:.0f}   {'✓' if ok_seat else '✗ 前后排'}")
+        print(f"  ①同深度=同桌  头高比={szr:.2f} ≤ {V.SEAT_DEPTH_RATIO_MAX}   {'✓' if ok_seat else '✗ 前后排/隔桌'}")
         print(f"  ②同深度  头高比={szr:.2f} ≤ {V.HEAD_SIZE_RATIO_MAX}   {'✓' if ok_depth else '✗ 前后排'}")
-        print(f"  ③邻座    dx={dx:.0f} ≤ {V.NEAR_DX_RATIO * ref:.0f}   {'✓' if ok_near else '✗ 隔太远'}")
-        print(f"  ④左右    dx={dx:.0f} ≥ dy×{V.NEIGHBOR_DX_RATIO}={dy * V.NEIGHBOR_DX_RATIO:.0f}   {'✓' if ok_lr else '✗ 偏前后'}")
+        print(f"  ③邻座    距={math.hypot(dx, dy):.0f} ≤ {V.SEAT_DIST_RATIO * ref:.0f}   {'✓' if ok_near else '✗ 隔太远'}")
+        print(f"  ④(旧判据'左右相邻'已废弃: 摄像头斜俯视下画面左右≠教室左右)")
         print(f"  ⑤转头    |ya|={abs(ya):.0f}° |yb|={abs(yb):.0f}° ≥ {V.MIN_TURN_YAW}°   {'✓' if ok_turn else '✗ 有人没转头'}")
         print(f"  ⑥互朝    a→b={a_toward} b→a={b_toward}   {'✓' if ok_toward else '✗ 背对背/同向'}")
         print(f"  ⑦夹角    {gaze:.1f}° ≥ {V.GAZE_OBTUSE_THRESH}°   {'✓' if ok_gaze else '✗ 不够钝'}")

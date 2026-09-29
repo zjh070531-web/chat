@@ -54,7 +54,7 @@ SRC_DIRS = [
 ]
 OUT_DIR = r"D:\chatting\_dataset"
 IMGSZ_DET = 1920             # 检测分辨率(调高, 远景小头也能检出)
-SAMPLE_INTERVAL = 2.0        # 每隔多少秒检一次 (调小 → 稀缺的"互相朝向"样本收得更多, 但更慢)
+SAMPLE_INTERVAL = 1.0        # 每隔多少秒检一次 (调小 → 收得更密, 但更慢)
 CLIP_DUR = 3.0               # 每个候选 clip 的时长(秒)
 OUT_SIZE = V.PAIR_PREP_SIZE  # 裁剪区统一缩放到的边长(与训练/推理预处理一致)
 MAX_PER_VIDEO = 60           # 每个源视频最多导出多少 clip(全局按可疑度排序后取前 N)
@@ -463,25 +463,18 @@ def main():
                 ra = (a["body"][3] - a["body"][1]) / max(1, a["bbox"][3] - a["bbox"][1])
                 rb = (b["body"][3] - b["body"][1]) / max(1, b["bbox"][3] - b["bbox"][1])
                 posture = (1 if ra >= SIT_STAND_RATIO else 0) + (1 if rb >= SIT_STAND_RATIO else 0)
+                dist = math.hypot(a["cx"] - b["cx"], a["cy"] - b["cy"]) / max(1.0, hh)
                 cands.append({
                     "fi": fi, "gaze": gaze, "toward": toward, "hh": hh, "a": a, "b": b,
                     "pre": prelabel(gaze, toward), "posture": posture, "ra": ra, "rb": rb,
+                    "dist": dist,
                     "mcx": (a["cx"] + b["cx"]) / 2.0, "mcy": (a["cy"] + b["cy"]) / 2.0,
                 })
-        # ---- 全局排序: 组内先"两个都坐着"(posture=0) → 一坐一站(1) → 都站着(2),
-        #      再按视线夹角从大到小; 最后"互相朝向"与其余按 2:1 交替 ----
-        cands.sort(key=lambda c: (0 if c["toward"] else 1, c["posture"], -c["gaze"]))
-        tow = [c for c in cands if c["toward"]]
-        oth = [c for c in cands if not c["toward"]]
-        cands, i1, i2 = [], 0, 0
-        while i1 < len(tow) or i2 < len(oth):
-            for _ in range(2):
-                if i1 < len(tow):
-                    cands.append(tow[i1]); i1 += 1
-            if i2 < len(oth):
-                cands.append(oth[i2]); i2 += 1
-        print(f"    真·邻座配对 {len(tow) + len(oth)} 个(互相朝向 {len(tow)}) "
-              f"→ 按可疑度取前 {args.max_per_video} 个")
+        # ---- 全局排序: 先"两个都坐着"(posture=0), 再按"两人头距/头高"从近到远 ----
+        # 交头接耳的关键是"两人坐得近", 视线交汇只是可有可无的信号, 所以按距离近优先
+        cands.sort(key=lambda c: (c["posture"], c["dist"]))
+        print(f"    真·邻座配对 {len(cands)} 个(互相朝向 {sum(1 for c in cands if c['toward'])}) "
+              f"→ 按距离近取前 {args.max_per_video} 个")
 
         # ---- 第二遍: 回放取 clip (write_clip 自己 seek, 与循环位置无关) ----
         recent = []                          # [(fi, cx, cy)] 相邻采样点去重

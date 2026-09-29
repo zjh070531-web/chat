@@ -88,8 +88,8 @@ def post_process_batch(imgs, paths, shapes, body_dets, part_dets, num_offsets, m
 # ==============================================================================
 # 【参数】★ 需要调节的都在这
 # ==============================================================================
-VIDEO_DIR = r"D:\video\1\1\right\cutting_video2"   # 输入视频目录
-OUTPUT_DIR = r"D:\chatting\outputs(2)"                # 输出目录
+VIDEO_DIR = r"D:\deeplearning\ultralytics-8.3.163\pose_behavior_package_imitate\交头接耳\cutting_video\cutting_video2\segment_005.mp4" # 输入视频目录
+OUTPUT_DIR = r"D:\chatting\outputs(3)"                # 输出目录
 FRAME_SKIP = 3                                      # 每3帧处理1帧 (提速; 输出视频时长不变)
 
 # ---- 检测 (防椅子靠背被当成人头) ----
@@ -137,7 +137,7 @@ SMOOTH_MATCH_DIST = 0.8       # 跨帧"同一个配对"的匹配上限 (×平均
 # ---- ②第二阶段: JEPA 二次确认 (视线夹角抓可疑 → JEPA 判"是否真在说话") ----
 # 思路: 第一段(视线夹角)只负责"抓可疑配对", 第二段用你训练的 V-JEPA 二分类模型
 #       (chatting/not_chatting) 裁剪"两人区域"的 16 帧 clip 再判一次, 过阈值才算确认。
-JEPA_ENABLE = True            # 关掉 = 退回只靠视线夹角的旧版
+JEPA_ENABLE = False           # 关掉 = 退回只靠视线夹角的旧版 (2026-09-29 暂时关闭, 只留第一阶段视线夹角)
 JEPA_ROOT = r"D:\jepa-main"   # V-JEPA 代码根目录 (src/ 在这里)
 JEPA_BACKBONE = r"D:\jepa-main\pretrained_weights\vitl16.pth.tar"          # 冻结主干
 JEPA_HEAD = r"D:\jepa-main\pretrained_weights\video_classification_frozen\ssv2-16x2x3\jepa-best.pth.tar"  # 分类头(best)
@@ -631,7 +631,7 @@ if __name__ == '__main__':
                     else:
                         yellow.append((i, j))
                 else:
-                    confirmed.append((i, j, 1.0))   # 无 JEPA 或历史不足 → 直接确认
+                    confirmed.append((i, j, gaze))   # 无 JEPA: 直接确认, 附上视线夹角(度)
             total_conf += len(confirmed)
 
             # ===== 7. 画结果: 红=确认交头接耳, 黄=可疑但被JEPA否决 =====
@@ -639,7 +639,8 @@ if __name__ == '__main__':
                 a, b = heads[i], heads[j]
                 cv2.line(im0, (int(a['cx']), int(a['cy'])), (int(b['cx']), int(b['cy'])),
                          (0, 0, 255), 3)
-                cv2.putText(im0, f"CHAT {p_chat:.0%}",
+                lbl = f"CHAT {p_chat:.0%}" if jepa_enc is not None else f"CHAT {p_chat:.0f}°"
+                cv2.putText(im0, lbl,
                             (int((a['cx'] + b['cx']) / 2) - 20, int((a['cy'] + b['cy']) / 2) - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
                 for p in (a, b):
@@ -659,6 +660,7 @@ if __name__ == '__main__':
             writer.write(annotated)
 
         writer.release()
-        print(f"已保存: {out_path}  (原始 {total_raw} 对次 → 可疑 {total_susp} 对次 → JEPA确认 {total_conf} 对次)")
+        stage3 = "JEPA确认" if jepa_enc is not None else "视线夹角确认"
+        print(f"已保存: {out_path}  (原始 {total_raw} 对次 → 可疑 {total_susp} 对次 → {stage3} {total_conf} 对次)")
 
     print("\n全部完成!")

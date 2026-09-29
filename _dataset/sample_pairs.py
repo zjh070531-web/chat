@@ -51,6 +51,9 @@ SRC_DIRS = [
     r"D:\video\1\1\right\cutting_video2",
     r"D:\video\1\1\right\cutting_video3",
     r"D:\video\1\1\right\cutting_video4",
+    r"D:\video\1\3",                          # 教室前中_右 (6.8人/帧)
+    r"D:\video\1\教室中后-左",               # 教室中后_左 (8.9人/帧, 丰富)
+    r"D:\video\1\教室中后-右",               # 教室中后_右 (3.0人/帧, 偏少但保留)
 ]
 OUT_DIR = r"D:\chatting\_dataset"
 IMGSZ_DET = 1920             # 检测分辨率(调高, 远景小头也能检出)

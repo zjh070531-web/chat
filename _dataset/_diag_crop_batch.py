@@ -12,7 +12,13 @@ import torch
 import sample_pairs as SP
 
 V = SP.V
-IMGS = sys.argv[1:]                # ★必须先存: SP.load_models 内部会重写 sys.argv(video.py:706)
+# ★必须先存: SP.load_models 内部会重写 sys.argv(video.py:706)
+IMGS = []
+for a in sys.argv[1:]:
+    if a.startswith("@"):                       # @列表文件: 每行一个路径
+        IMGS += [ln.strip() for ln in open(a[1:], encoding="utf-8") if ln.strip()]
+    else:
+        IMGS.append(a)
 CONF, MIN_FS = 0.15, 0.30          # 小截图要放宽
 agent, det_model = SP.load_models(1280)
 

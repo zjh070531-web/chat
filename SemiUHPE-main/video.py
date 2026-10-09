@@ -12,8 +12,8 @@ r"""
 已去掉的东西: yaw时序信任 / 8道关卡 / 加权评分 / 追踪补位 / 3D头模 / 多进程 / GIF
 设计取舍: 宁可漏检, 不要误判; 所有可调参数都在下面【参数】区
 
-位置: D:\chatting\SemiUHPE-main\video.py  (与 src/ utils/ models/ weights/ 同级)
-运行: python D:\chatting\SemiUHPE-main\video.py
+位置: SemiUHPE-main/video.py  (与 src/ utils/ models/ weights/ 同级)
+运行: python SemiUHPE-main/video.py --video-dir <视频目录> --output-dir <输出目录>
 """
 
 import os
@@ -31,7 +31,7 @@ from pathlib import Path
 from tqdm import tqdm
 
 # ============ 路径: 代码/权重在 SemiUHPE-main 子目录 ============
-PY_ROOT = r"D:\chatting\SemiUHPE-main"
+PY_ROOT = os.path.dirname(os.path.abspath(__file__))  # 本文件所在目录; 随仓库移动, 不写死绝对路径
 if PY_ROOT not in sys.path:
     sys.path.insert(0, PY_ROOT)
 os.chdir(PY_ROOT)  # 让 weights/ 和 settings/ 等相对路径生效
@@ -92,8 +92,10 @@ def post_process_batch(imgs, paths, shapes, body_dets, part_dets, num_offsets, m
 # ==============================================================================
 # 【参数】★ 需要调节的都在这
 # ==============================================================================
-VIDEO_DIR = r"D:\chatting\屏幕录制 2026-09-29 235557.mp4" # 输入视频目录
-OUTPUT_DIR = r"D:\chatting\outputs(8)"                # 输出目录
+# 输入/输出: 优先级 = 命令行 --video-dir/--output-dir > 环境变量 > 下面这两个默认值
+# 不再写死本机绝对路径, 换机器 / clone 仓库后可直接用
+VIDEO_DIR = os.environ.get("CHATTING_VIDEO_DIR", "./videos")     # 输入视频目录(或单个视频文件)
+OUTPUT_DIR = os.environ.get("CHATTING_OUTPUT_DIR", "./outputs")  # 输出目录
 FRAME_SKIP = 3                                      # 每3帧处理1帧 (提速; 输出视频时长不变)
 
 # ---- 检测 (防椅子靠背被当成人头) ----
@@ -160,9 +162,10 @@ SMOOTH_MATCH_DIST = 0.8       # 跨帧"同一个配对"的匹配上限 (×平均
 # 思路: 第一段(视线夹角)只负责"抓可疑配对", 第二段用你训练的 V-JEPA 二分类模型
 #       (chatting/not_chatting) 裁剪"两人区域"的 16 帧 clip 再判一次, 过阈值才算确认。
 JEPA_ENABLE = False           # 关掉 = 退回只靠视线夹角的旧版 (2026-09-29 暂时关闭, 只留第一阶段视线夹角)
-JEPA_ROOT = r"D:\jepa-main"   # V-JEPA 代码根目录 (src/ 在这里)
-JEPA_BACKBONE = r"D:\jepa-main\pretrained_weights\vitl16.pth.tar"          # 冻结主干
-JEPA_HEAD = r"D:\jepa-main\pretrained_weights\video_classification_frozen\ssv2-16x2x3\jepa-best.pth.tar"  # 分类头(best)
+# JEPA 代码与权重不随本仓库分发, 用环境变量指过去 (JEPA_ENABLE=True 时必须设置 JEPA_ROOT)
+JEPA_ROOT = os.environ.get("JEPA_ROOT", "")  # V-JEPA 代码根目录 (src/ 在这里)
+JEPA_BACKBONE = os.environ.get("JEPA_BACKBONE", os.path.join(JEPA_ROOT, "pretrained_weights", "vitl16.pth.tar"))  # 冻结主干
+JEPA_HEAD = os.environ.get("JEPA_HEAD", os.path.join(JEPA_ROOT, "pretrained_weights", "video_classification_frozen", "ssv2-16x2x3", "jepa-best.pth.tar"))  # 分类头(best)
 JEPA_CONFIRM_THRESH = 0.5     # P(交头接耳) ≥ 该值才最终确认 (0.5=取argmax; 调高更严)
 JEPA_FRAMES = 16              # 采 16 帧 (与训练一致)
 JEPA_FRAME_STEP = 4           # 帧步长 4 → 16×4=64 帧 ≈ 3.2s 的时间窗
@@ -691,6 +694,15 @@ class H264Writer:
 # 主流程
 # ==============================================================================
 if __name__ == '__main__':
+    import argparse
+    _ap = argparse.ArgumentParser(description="交头接耳检测 v1 (精简版)")
+    _ap.add_argument("--video-dir", default=VIDEO_DIR,
+                     help="输入视频目录或单个视频文件 (默认: 环境变量 CHATTING_VIDEO_DIR / ./videos)")
+    _ap.add_argument("--output-dir", default=OUTPUT_DIR,
+                     help="输出目录 (默认: 环境变量 CHATTING_OUTPUT_DIR / ./outputs)")
+    _args = _ap.parse_args()
+    VIDEO_DIR, OUTPUT_DIR = _args.video_dir, _args.output_dir
+
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     if os.path.isfile(VIDEO_DIR):                       # 指向单个视频文件
         video_files = [VIDEO_DIR]

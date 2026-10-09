@@ -1,0 +1,38 @@
+# ==========================================================
+# 交头接耳检测 · .gitattributes
+# 统一换行符，并标记二进制文件（避免 GitHub 把它们当文本做 diff / 统计语言）
+# ==========================================================
+
+# ---------- 换行符 ----------
+# 出入库统一用 LF；Windows 工作区自动转 CRLF
+* text=auto
+
+*.py      text eol=lf
+*.md      text eol=lf
+*.txt     text eol=lf
+*.yml     text eol=lf
+*.yaml    text eol=lf
+*.sh      text eol=lf
+*.bat     text eol=crlf
+
+# ---------- 二进制 ----------
+*.pyd    binary
+*.pth    binary
+*.pt     binary
+*.onnx   binary
+*.npy    binary
+*.npz    binary
+*.ttf    binary
+*.png    binary
+*.jpg    binary
+*.jpeg   binary
+*.gif    binary
+*.mp4    binary
+*.zip    binary
+
+# ---------- GitHub 语言统计 ----------
+# 第三方/上游整包不计入项目语言占比
+SemiUHPE-main/utils/** linguist-vendored
+SemiUHPE-main/models/** linguist-vendored
+SemiUHPE-main/Sim3DR/** linguist-vendored
+docs/** linguist-documentation

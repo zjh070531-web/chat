@@ -1,0 +1,35 @@
+# ==========================================================
+# 交头接耳检测 · 依赖清单
+#
+# 仅推理（跑 SemiUHPE-main/video.py）装「核心依赖」即可；
+# 训练 / 评估 / 数据工具再装「可选依赖」。
+#
+# 建议先按自己的 CUDA 版本装好 PyTorch，再装本文件：
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+#   pip install -r requirements.txt
+# ==========================================================
+
+# ---------- 核心依赖（推理必需） ----------
+numpy>=1.24
+opencv-python>=4.8
+scipy>=1.10
+Pillow>=9.5
+PyYAML>=6.0
+configargparse>=1.5
+tqdm>=4.65
+pandas>=2.0
+requests>=2.31
+matplotlib>=3.7
+
+# ---------- 可选：训练 / 评估 ----------
+# pytorch3d         # eval.py / src/agent.py 在部分配置下需要，按官方指引安装
+# imageio           # image.py 生成 GIF 时用
+
+# ---------- 可选：Sim3DR 3D 人脸渲染 ----------
+# 仓库已附带 Windows / Python 3.10 预编译的 Sim3DR_Cython.cp310-win_amd64.pyd，
+# 该环境可直接使用；其他平台需自行编译：
+#   cd SemiUHPE-main/Sim3DR && pip install Cython && python setup.py build_ext --inplace
+# Cython>=0.29
+
+# ---------- 注意 ----------
+# 模型权重不随仓库分发，请按 README「模型权重」一节下载后放入 SemiUHPE-main/weights/

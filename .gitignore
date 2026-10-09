@@ -1,37 +1,94 @@
-# ===== 大文件: 权重/视频/压缩包 =====
+# ==========================================================
+# 交头接耳检测 · .gitignore   (UTF-8 编码)
+# 目标: 只把「源码 + 文档 + 必要的二进制资源」推到 GitHub,
+#       权重/视频/输出/依赖备份一律不入库。
+# ==========================================================
+
+# ---------- 模型权重 (体积大, 改为 README 里给下载方式) ----------
 *.pt
 *.pth
+*.pth.tar
+*.ckpt
 *.onnx
+*.engine
+*.safetensors
+*.bin
+
+# ---------- 视频 / 动图 ----------
 *.mp4
 *.avi
 *.mkv
 *.mov
+*.flv
+*.wmv
+*.webm
+*.gif
+
+# ---------- 压缩包 / 文档 ----------
 *.zip
 *.rar
 *.7z
+*.tar
+*.tar.gz
 *.pdf
 
-# ===== 输出目录 =====
-outputs/
+# ---------- 运行结果输出 (outputs / outputs(10) / outputs(11) ...) ----------
+outputs*/
+outputs(*)/
 
-# ===== Python 缓存 =====
+# ---------- 数据集素材 (原始片段, 体积大) ----------
+_dataset/clips/
+_dataset/crops/
+_dataset/_orphan_clips_*/
+_dataset/**/*.mp4
+
+# ---------- Python ----------
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
+*.egg-info/
+.eggs/
+*.egg
 
-# ===== 编译产物 =====
+# ---------- 虚拟环境 ----------
+.venv/
+venv/
+env/
+ENV/
+
+# ---------- C/Cython 编译产物 ----------
 *.o
 *.so
 *.dll
+*.dylib
+*.obj
+*.exp
+*.lib
+*.a
+build/
+dist/
+*.spec
 
-# ===== WorkBuddy 会话数据 =====
+# ---------- 转头识别工程 (turnhead) ----------
+# 自带 513MB PyTorch 整包备份 + 1GB 测试视频 + 368MB 权重, 属于独立工程,
+# 本次不入库。若以后要单独开源, 建议另开一个仓库。
+turnhead/
+
+# ---------- 发布包 / 旧备份 / 中间产物 ----------
+发布包_*/
+_backup/
+*.tmp
+*.bak
+*.log
+
+# ---------- WorkBuddy 会话数据 ----------
 .workbuddy/
 
-# ===== 系统/编辑器 =====
+# ---------- 系统 / 编辑器 ----------
 Thumbs.db
+Thumbs.db:encryptable
 .DS_Store
-_dataset/track.json
-发布包_站立识别_v1/
-
-# ===== 误解压进来的第三方仓库整包 (与交头接耳项目无关, 别提交) =====
-turnhead/
+.idea/
+.vscode/
+*.swp

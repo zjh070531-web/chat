@@ -52,10 +52,13 @@ __pycache__/
 *.egg
 
 # ---------- 本地临时产物 / 调试截图 (不随代码入库) ----------
+# 统一存放约定: _artifacts/<日期>_<话题>/   (每次对话一个子目录, 见 _artifacts/README.md)
+_artifacts/
 preview_*.png
 pose_compare.png
 person_raw.png
 person_*.png
+dir_*.png
 _hud_test*.png
 _pos_test.png
 屏幕截图*.jpg

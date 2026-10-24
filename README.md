@@ -69,6 +69,7 @@ flowchart TB
 │   ├── track_heads.py      # 头部跟踪
 │   └── _diag_*.py          # 各类诊断脚本
 ├── _diag/                  # 阶段性诊断与预览脚本
+├── _artifacts/             # 调试中间产物（截图/对比图/探针脚本），按对话分目录，不入库
 ├── docs/                   # 设计文档
 └── mcp_zhipu_vision/       # 智谱视觉模型 MCP server（看图辅助）
 ```
@@ -78,6 +79,24 @@ flowchart TB
 > `_dataset/` 下的诊断脚本统一通过 `import video as V` 复用主逻辑；由于它们都会先导入
 > `sample_pairs`，而 `sample_pairs` 会把 `SemiUHPE-main/` 加入 `sys.path`，
 > 因此解析到的是 `SemiUHPE-main/video.py`，与根目录无关。
+
+### 中间产物存放约定
+
+调试产生的截图、对比图、一次性探针脚本，一律放进 `_artifacts/`，**按对话（话题）分子目录**，
+命名格式 `<日期>_<话题>`，便于回溯「这张图是哪次讨论留下来的」：
+
+```
+_artifacts/
+├── 2026-10-24_hud/          # 那次对话：结果面板样式与拖动定位
+│   ├── preview_hud.png
+│   └── preview_hud_moved.png
+└── 2026-10-24_face-pose/    # 那次对话：3D 人脸朝向排查
+    ├── dir_full.png
+    └── pose_compare.png
+```
+
+`_artifacts/` 整目录已在 `.gitignore` 中，不会进版本库；需要长期保留的结论性材料，
+应整理进 `docs/`。
 
 ---
 

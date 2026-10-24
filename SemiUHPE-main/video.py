@@ -19,7 +19,9 @@ r"""
 import os
 import sys
 import glob
+import json
 import math
+import time
 import random
 from collections import deque
 
@@ -94,8 +96,11 @@ def post_process_batch(imgs, paths, shapes, body_dets, part_dets, num_offsets, m
 # ==============================================================================
 # 输入/输出: 优先级 = 命令行 --video-dir/--output-dir > 环境变量 > 下面这两个默认值
 # 不再写死本机绝对路径, 换机器 / clone 仓库后可直接用
-VIDEO_DIR = os.environ.get("CHATTING_VIDEO_DIR", "./videos")     # 输入视频目录(或单个视频文件)
-OUTPUT_DIR = os.environ.get("CHATTING_OUTPUT_DIR", "./outputs")  # 输出目录
+VIDEO_DIR = os.environ.get(
+    "CHATTING_VIDEO_DIR",
+    r"D:\video\2\教室中后-右\教室中后_右_802监控_802监控_20260830161715"
+)  # 输入视频目录(或单个视频文件)
+OUTPUT_DIR = os.environ.get("CHATTING_OUTPUT_DIR", r"D:\chatting\outputs(13)")  # 输出目录
 FRAME_SKIP = 3                                      # 每3帧处理1帧 (提速; 输出视频时长不变)
 
 # ---- 检测 (防椅子靠背被当成人头) ----
@@ -188,6 +193,57 @@ MATCH_IOU_THRES = 0.6
 EDGES_SCALE = -0.05
 YAW_SIGN = -1                # yaw 符号约定 (与 SemiUHPE 输出对接)
 SAVE_HEIGHT = 720            # 输出视频高度
+
+# ---- 进度条 / 超时 (防止单个大视频把整晚都占住) ----
+TIMEOUT_MIN = 30.0           # ★单个视频处理超时(分钟); 0 = 不限。超时后取消该视频
+STOP_ON_TIMEOUT = False      # True = 任一视频超时后整个脚本退出; False = 只放弃该视频, 继续下一个
+DELETE_PARTIAL = False       # True = 超时取消时把半成品视频一起删掉
+DEBUG_PAIRS = False          # True = 打印每一对成交接耳的判据数值 (也可用 --debug-pairs)
+
+# ---- 左上角结果面板 (HUD) ----
+HUD_ENABLE = True            # 关掉 = 回到原来那行小字
+HUD_SCALE = 1.25             # ★整体大小 (以 720p 为基准); 1.2 = 更大更醒目
+HUD_OFFSET_X = 0.0125        # 左边距 (占画面宽度比例)
+HUD_OFFSET_Y = 0.150         # 上边距 (占画面高度比例); 用来避开摄像头自带的时间水印, 想贴顶就改 0.02
+HUD_FONT_CANDIDATES = [
+    r"C:\Windows\Fonts\msyhbd.ttc",   # 微软雅黑 Bold
+    r"C:\Windows\Fonts\msyh.ttc",
+    r"C:\Windows\Fonts\simhei.ttf",
+    "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+]
+# 面板位置可以拖动: python video.py --pick-hud 拖好后回车, 位置存到这个文件, 之后每次渲染都按它画
+HUD_POS_FILE = os.path.join(PY_ROOT, "hud_position.json")
+
+
+def load_hud_pos(path=HUD_POS_FILE):
+    """读取拖动保存的面板位置 (画面宽/高比例); 没有或读不了就返回 None"""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        x, y = float(d["x"]), float(d["y"])
+        if 0.0 <= x <= 1.0 and 0.0 <= y <= 1.0:
+            return x, y
+    except Exception:
+        pass
+    return None
+
+
+def save_hud_pos(x, y, path=HUD_POS_FILE):
+    """保存面板位置 (比例坐标)"""
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"x": round(float(x), 4), "y": round(float(y), 4),
+                       "note": "画面宽高比例; 改这里或重新 --pick-hud 拖动即可"}, f,
+                      ensure_ascii=False, indent=2)
+        return True
+    except Exception as e:
+        print(f"[HUD] 保存位置失败: {e}")
+        return False
+
+
+_saved_hud_pos = load_hud_pos()          # 有保存过就优先用保存的位置
+if _saved_hud_pos is not None:
+    HUD_OFFSET_X, HUD_OFFSET_Y = _saved_hud_pos
 
 
 # ==============================================================================
@@ -691,6 +747,212 @@ class H264Writer:
 
 
 # ==============================================================================
+# 左上角结果面板 (HUD): 半透明圆角底板 + 大号数字, 按画面高度自动缩放
+# ==============================================================================
+_hud_fonts = {}
+_hud_cache = {}
+
+
+def _hud_font(px):
+    """按像素大小取字体 (带缓存); 找不到中文字体时退回 PIL 默认字体 (中文会显示成方块)"""
+    from PIL import ImageFont
+    px = max(8, int(px))
+    if px in _hud_fonts:
+        return _hud_fonts[px]
+    font = None
+    for path in HUD_FONT_CANDIDATES:
+        if os.path.exists(path):
+            try:
+                font = ImageFont.truetype(path, px)
+                break
+            except Exception:
+                font = None
+    if font is None:
+        font = ImageFont.load_default()
+    _hud_fonts[px] = font
+    return font
+
+
+def _make_hud(n_heads, n_chat, n_susp, sub_text, frame_h):
+    """渲染一块带 alpha 的 HUD 小图, 返回 (bgr, alpha[h,w,1] in 0..1)。尺寸随 frame_h 缩放。"""
+    from PIL import Image, ImageDraw
+
+    s = frame_h / 720.0 * HUD_SCALE            # 以 720p 为基准的整体缩放系数
+    f_num = _hud_font(round(44 * s))           # 大号数字
+    f_lab = _hud_font(round(17 * s))           # 数字下方标签
+    f_sub = _hud_font(round(15 * s))           # 底部说明
+    pad = round(16 * s)
+    gap = round(34 * s)
+    metric_gap = round(16 * s)
+    blk_pad = round(6 * s)
+
+    metrics = [(f"{n_heads}", "人头", (255, 255, 255)),
+               (f"{n_chat}", "交头接耳", (255, 92, 96)),       # RGB 红
+               (f"{n_susp}", "可疑", (255, 191, 74))]         # RGB 琥珀
+
+    probe = ImageDraw.Draw(Image.new("RGB", (8, 8)))
+
+    def text_wh(txt, font):
+        l, t, r, b = probe.textbbox((0, 0), txt, font=font)
+        return r - l, b - t
+
+    num_wh = [text_wh(m[0], f_num) for m in metrics]
+    lab_wh = [text_wh(m[1], f_lab) for m in metrics]
+    blk_w = [max(n[0], l[0]) for n, l in zip(num_wh, lab_wh)]
+    num_h = max(n[1] for n in num_wh)
+    lab_h = max(l[1] for l in lab_wh)
+    sub_h = text_wh(sub_text, f_sub)[1] if sub_text else 0
+
+    w = pad * 2 + sum(blk_w) + blk_pad * len(blk_w) + gap * (len(metrics) - 1)
+    h = pad * 2 + num_h + metric_gap + lab_h + ((round(14 * s) + sub_h) if sub_text else 0)
+    w, h = max(w, round(150 * s)), max(h, round(56 * s))
+
+    img = Image.new("RGBA", (int(w), int(h)), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle([0, 0, w - 1, h - 1], radius=round(12 * s),
+                        fill=(10, 12, 16, 190), outline=(255, 255, 255, 26), width=max(1, round(s)))
+
+    x = pad
+    for i, (val, lab, rgb) in enumerate(metrics):
+        bw = blk_w[i] + blk_pad
+        tx_num = x + (bw - num_wh[i][0]) / 2.0
+        tx_lab = x + (bw - lab_wh[i][0]) / 2.0
+        ty_num, ty_lab = pad, pad + num_h + metric_gap
+        # 数字带一点投影, 压住亮背景
+        d.text((tx_num + 1, ty_num + 2), val, font=f_num, fill=(0, 0, 0, 120))
+        d.text((tx_num, ty_num), val, font=f_num, fill=rgb + (255,))
+        d.text((tx_lab, ty_lab), lab, font=f_lab, fill=(184, 192, 204, 240))
+        x += bw
+        if i < len(metrics) - 1:                      # 竖分隔线
+            d.line([(x + gap / 2 - blk_pad / 2, pad), (x + gap / 2 - blk_pad / 2, pad + num_h + metric_gap + lab_h)],
+                   fill=(255, 255, 255, 34), width=max(1, round(1.2 * s)))
+            x += gap
+
+    if sub_text:
+        d.text((pad, h - pad - sub_h - round(2 * s)), sub_text, font=f_sub,
+               fill=(150, 158, 170, 240))
+
+    arr = np.asarray(img)
+    bgr = np.ascontiguousarray(arr[:, :, 2::-1])       # RGB -> BGR
+    alpha = (arr[:, :, 3:4].astype(np.float32) / 255.0)
+    return bgr, alpha
+
+
+def _get_hud(n_heads, n_chat, n_susp, sub_text, frame_h):
+    """取 (带 alpha 的) 面板小图; 内容不变时复用缓存"""
+    key = (n_heads, n_chat, n_susp, sub_text, frame_h)
+    item = _hud_cache.get(key)
+    if item is None:
+        item = _make_hud(n_heads, n_chat, n_susp, sub_text, frame_h)
+        if len(_hud_cache) > 400:
+            _hud_cache.clear()
+        _hud_cache[key] = item
+    return item
+
+
+def _blend_hud(img, bgr, alpha, x0, y0):
+    """把面板叠加到 img 的 (x0,y0) 位置 (就地修改); 超出边界自动裁剪"""
+    h, w = img.shape[:2]
+    ph, pw = bgr.shape[:2]
+    x0, y0 = int(round(x0)), int(round(y0))
+    x0 = max(0, min(x0, w - 1))
+    y0 = max(0, min(y0, h - 1))
+    pw, ph = min(pw, w - x0), min(ph, h - y0)
+    if pw <= 0 or ph <= 0:
+        return img
+    roi = img[y0:y0 + ph, x0:x0 + pw]
+    a = alpha[:ph, :pw]
+    img[y0:y0 + ph, x0:x0 + pw] = (roi.astype(np.float32) * (1.0 - a)
+                                   + bgr[:ph, :pw].astype(np.float32) * a).astype(np.uint8)
+    return img
+
+
+def draw_hud(img, n_heads, n_chat, n_susp, sub_text=""):
+    """把结果面板贴到 HUD_OFFSET_X/Y 指定的位置 (就地修改 img); 数值没变时直接复用缓存, 几乎不耗时"""
+    if not HUD_ENABLE:
+        return img
+    h, w = img.shape[:2]
+    try:
+        bgr, alpha = _get_hud(n_heads, n_chat, n_susp, sub_text, h)
+    except Exception:                                   # 没装 Pillow 等情况: 退回单行文字
+        cv2.putText(img, f"{n_heads} Heads | {n_chat} CHAT | {n_susp} ?",
+                    (int(8 * h / 720), int(30 * h / 720)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.1 * h / 720, (255, 255, 255), 2)
+        return img
+    return _blend_hud(img, bgr, alpha, HUD_OFFSET_X * w, HUD_OFFSET_Y * h)
+
+
+def _hud_drag_handler(state, pw, ph, W, H):
+    """鼠标拖动回处理: 按在面板上才拖, 拖出画面会被夹住。state 里存 x/y/drag/ox/oy"""
+    def on_mouse(event, mx, my, flags, param):
+        if event == cv2.EVENT_LBUTTONDOWN:
+            if state['x'] <= mx <= state['x'] + pw and state['y'] <= my <= state['y'] + ph:
+                state['drag'] = True
+                state['ox'], state['oy'] = mx - state['x'], my - state['y']
+        elif event == cv2.EVENT_MOUSEMOVE and state['drag']:
+            state['x'] = max(0, min(W - pw, mx - state['ox']))
+            state['y'] = max(0, min(H - ph, my - state['oy']))
+        elif event == cv2.EVENT_LBUTTONUP:
+            state['drag'] = False
+    return on_mouse
+
+
+def place_hud_interactive(video_path, pos_file=HUD_POS_FILE, counts=(9, 1, 0), sub_text="", win="HUD drag"):
+    """打开窗口, 用鼠标把结果面板拖到想要的位置, 回车保存 (存成画面比例), ESC 取消。
+    返回保存的 (x, y) 比例坐标; 取消返回 None。"""
+    cap = cv2.VideoCapture(video_path)
+    ok, frame = cap.read()
+    cap.release()
+    if not ok or frame is None:
+        print(f"[定位] 读不到视频画面: {video_path}")
+        return None
+
+    H0, W0 = frame.shape[:2]
+    k = min(1.0, 1280.0 / W0, 760.0 / H0)           # 大画面缩小到能放进窗口
+    if k < 1.0:
+        frame = cv2.resize(frame, (int(W0 * k), int(H0 * k)), interpolation=cv2.INTER_AREA)
+    H, W = frame.shape[:2]
+    bgr, alpha = _get_hud(counts[0], counts[1], counts[2], sub_text, H)
+    ph, pw = bgr.shape[:2]
+
+    px, py = load_hud_pos(pos_file) or (HUD_OFFSET_X, HUD_OFFSET_Y)
+    state = {'x': int(round(px * W)), 'y': int(round(py * H)), 'drag': False, 'ox': 0, 'oy': 0}
+    state['x'] = max(0, min(W - pw, state['x']))
+    state['y'] = max(0, min(H - ph, state['y']))
+
+    cv2.namedWindow(win, cv2.WINDOW_AUTOSIZE)
+    cv2.setMouseCallback(win, _hud_drag_handler(state, pw, ph, W, H))
+    print("[定位] 用鼠标拖动面板 → 回车保存 / ESC 取消 / 方向键微调 / r 复位")
+
+    while True:
+        shown = _blend_hud(frame.copy(), bgr, alpha, state['x'], state['y'])
+        cv2.putText(shown, "drag: mouse   save: Enter   cancel: ESC   nudge: arrows",
+                    (10, H - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(shown, "drag: mouse   save: Enter   cancel: ESC   nudge: arrows",
+                    (10, H - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.imshow(win, shown)
+        key = cv2.waitKey(30) & 0xFFFF
+        if key in (13, 10, ord('s'), ord('S')):      # 回车 / s 保存
+            x, y = state['x'] / float(W), state['y'] / float(H)
+            cv2.destroyWindow(win)
+            if save_hud_pos(x, y, pos_file):
+                print(f"[定位] 已保存: {pos_file}  (x={x:.3f}, y={y:.3f})")
+                return x, y
+            return None
+        if key in (27, ord('q'), ord('Q')):          # ESC / q 取消
+            cv2.destroyWindow(win)
+            print("[定位] 已取消, 位置未改动")
+            return None
+        if key == ord('r'):                          # 复位到默认
+            state['x'], state['y'] = 0, 0
+        step = 5
+        if key == 2424832:  state['x'] = max(0, state['x'] - step)          # ←
+        elif key == 2555904: state['x'] = min(W - pw, state['x'] + step)    # →
+        elif key == 2490368: state['y'] = max(0, state['y'] - step)         # ↑
+        elif key == 2621440: state['y'] = min(H - ph, state['y'] + step)    # ↓
+
+
+# ==============================================================================
 # 主流程
 # ==============================================================================
 if __name__ == '__main__':
@@ -700,8 +962,30 @@ if __name__ == '__main__':
                      help="输入视频目录或单个视频文件 (默认: 环境变量 CHATTING_VIDEO_DIR / ./videos)")
     _ap.add_argument("--output-dir", default=OUTPUT_DIR,
                      help="输出目录 (默认: 环境变量 CHATTING_OUTPUT_DIR / ./outputs)")
+    _ap.add_argument("--timeout-min", type=float, default=TIMEOUT_MIN,
+                     help="单个视频处理超时分钟数, 超过则取消该视频 (默认: 30; 0=不限)")
+    _ap.add_argument("--stop-on-timeout", action="store_true", default=STOP_ON_TIMEOUT,
+                     help="任一视频超时后直接退出整个脚本 (默认: 只放弃该视频, 继续下一个)")
+    _ap.add_argument("--delete-partial", action="store_true", default=DELETE_PARTIAL,
+                     help="超时取消时删除半成品视频文件 (默认: 保留可播放的前半段)")
+    _ap.add_argument("--pick-hud", action="store_true",
+                     help="打开窗口用鼠标拖动结果面板, 回车保存位置后退出 (下次渲染生效)")
+    _ap.add_argument("--debug-pairs", action="store_true",
+                     help="把每一对判定成交头接耳的判据数值打印出来 (排查误报用)")
+    _ap.add_argument("--hud-pos", type=str, default=None,
+                     help="直接指定面板位置, 格式 'x,y' (0~1 的画面比例), 例: --hud-pos 0.02,0.02")
     _args = _ap.parse_args()
     VIDEO_DIR, OUTPUT_DIR = _args.video_dir, _args.output_dir
+    TIMEOUT_MIN, STOP_ON_TIMEOUT, DELETE_PARTIAL = _args.timeout_min, _args.stop_on_timeout, _args.delete_partial
+    DEBUG_PAIRS = _args.debug_pairs
+    if _args.hud_pos:
+        try:
+            _hx, _hy = [float(v) for v in _args.hud_pos.replace("，", ",").split(",")[:2]]
+            HUD_OFFSET_X, HUD_OFFSET_Y = _hx, _hy
+            save_hud_pos(_hx, _hy)
+            print(f"[HUD] 面板位置已设为 x={_hx:.3f}, y={_hy:.3f} (已写入 {HUD_POS_FILE})")
+        except Exception:
+            print(f"[HUD] --hud-pos 格式不对: {_args.hud_pos!r}, 应形如 0.02,0.02")
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     if os.path.isfile(VIDEO_DIR):                       # 指向单个视频文件
@@ -709,6 +993,23 @@ if __name__ == '__main__':
     else:                                               # 指向目录: 处理里面所有 mp4
         video_files = sorted(glob.glob(os.path.join(VIDEO_DIR, "*.mp4")))
     print(f"[输入] {VIDEO_DIR}\n[输出] {OUTPUT_DIR}\n[视频] {len(video_files)} 个")
+    if HUD_ENABLE:
+        print(f"[HUD] 面板位置 x={HUD_OFFSET_X:.3f}, y={HUD_OFFSET_Y:.3f}"
+              + (" (来自 hud_position.json)" if load_hud_pos() is not None else " (默认)")
+              + "；想拖动定位就运行: python video.py --pick-hud")
+
+    # ---------- 拖动定位面板: 拖好回车保存, 然后退出 ----------
+    if _args.pick_hud:
+        if not video_files:
+            print("[定位] 没有可用的视频文件, 无法取画面")
+            sys.exit(1)
+        _sub = (f"座位: 深度比 ≤ {SEAT_DEPTH_RATIO_MAX:g}" if SEAT_MODE == "depth" else "座位: 桌线")
+        place_hud_interactive(video_files[0], HUD_POS_FILE, (9, 1, 0), _sub)
+        print("位置已定, 直接重新运行本脚本(不加 --pick-hud)即可按新位置渲染")
+        sys.exit(0)
+    if TIMEOUT_MIN > 0:
+        print(f"[超时] 单个视频上限 {TIMEOUT_MIN:g} 分钟, 超过自动取消"
+              + ("并退出脚本" if STOP_ON_TIMEOUT else ", 继续下一个视频"))
     if SMOOTH_ENABLE:
         print(f"[时序] 平滑开: 连续 {SMOOTH_CONFIRM_FRAMES} 个处理帧确认, "
               f"确认后容忍漏检 {SMOOTH_HOLD_FRAMES} 帧 "
@@ -761,6 +1062,7 @@ if __name__ == '__main__':
             print("[JEPA] 第二阶段不可用, 本次运行退回旧版 (只靠视线夹角判定)")
 
     # ---------- 逐个视频处理 ----------
+    stopped_early = False
     for vi, video_path in enumerate(video_files):
         name = os.path.splitext(os.path.basename(video_path))[0]
         print(f"\n===== [{vi + 1}/{len(video_files)}] {name} =====")
@@ -787,7 +1089,32 @@ if __name__ == '__main__':
         total_susp = 0
         total_conf = 0
         annotated = None                           # 上一帧标注画面(720p), 跳帧时复用
-        for fi, (path, img, im0, _) in enumerate(tqdm(dataset, desc=name)):
+
+        # ---------- 进度条: 用真实总帧数, 显示百分比 / 速度 / ETA / 超时倒计时 ----------
+        n_frames = 0
+        try:
+            n_frames = int(getattr(dataset, "frames", 0) or 0)
+        except Exception:
+            n_frames = 0
+        if n_frames <= 0:
+            try:
+                cap_n = int(dataset.cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+                n_frames = cap_n if cap_n > 0 else 0
+            except Exception:
+                n_frames = 0
+        bar = tqdm(total=n_frames if n_frames > 0 else None,
+                   desc=f"[{vi + 1}/{len(video_files)}] {name}",
+                   unit="帧", dynamic_ncols=True, mininterval=0.5, leave=True)
+        t_video = time.time()                      # 本视频计时起点 (只算处理时间, 不含加载模型)
+        timed_out = False
+        for fi, (path, img, im0, _) in enumerate(dataset):
+            bar.update(1)
+
+            # ---- 超时保护: 单个视频处理超过 TIMEOUT_MIN 分钟就取消 ----
+            if TIMEOUT_MIN > 0 and (time.time() - t_video) > TIMEOUT_MIN * 60.0:
+                timed_out = True
+                break
+
             img_h, img_w = im0.shape[:2]
             if fi % FRAME_SKIP != 0:
                 jepa_buf.append(cv2.resize(im0, (out_w, out_h)))   # 跳帧: 原始帧也进缓冲
@@ -896,6 +1223,19 @@ if __name__ == '__main__':
             # ===== 5. 判定: 座位约束(桌子坐标) + 视线夹角钝角 → 一对一匹配 =====
             raw_pairs = one_to_one(judge_pairs(heads, desk_frame))
             total_raw += len(raw_pairs)
+            if DEBUG_PAIRS:
+                for (pi, pj, pg) in raw_pairs:
+                    pa, pb = heads[pi], heads[pj]
+                    ph_a = pa['bbox'][3] - pa['bbox'][1]
+                    ph_b = pb['bbox'][3] - pb['bbox'][1]
+                    ph_ref = (ph_a + ph_b) / 2.0
+                    pdist = math.hypot(pa['cx'] - pb['cx'], pa['cy'] - pb['cy'])
+                    print(f"[配对] f{fi} 头{pi}-头{pj}: 外角 {pg:.1f}° (≥{GAZE_OBTUSE_THRESH:g}) | "
+                          f"yaw {pa['yaw']:+.1f}°/{pb['yaw']:+.1f}° (各需≥{MIN_TURN_YAW:g}) | "
+                          f"pitch {pa['pitch']:+.1f}°/{pb['pitch']:+.1f}° | "
+                          f"头高 {ph_a:.0f}/{ph_b:.0f}px 比 {max(ph_a, ph_b) / min(ph_a, ph_b):.2f} "
+                          f"(≤{SEAT_DEPTH_RATIO_MAX:g}) | 中心距 {pdist:.0f}px = "
+                          f"{pdist / ph_ref:.2f}×头高 (≤{SEAT_DIST_RATIO:g})")
 
             # ===== 6. 时序平滑 → 可疑配对 (带 track id) =====
             suspicious = smoother.update(raw_pairs, heads)
@@ -925,56 +1265,84 @@ if __name__ == '__main__':
             total_conf += len(confirmed)
 
             # ===== 8. 画结果: 红=确认交头接耳, 黄=可疑但被JEPA否决 =====
+            k = max(1.0, img_h / 720.0)        # 线宽/字号随分辨率缩放 (4K 输入不会被缩小到看不见)
             for (i, j, p_chat) in confirmed:
                 a, b = heads[i], heads[j]
                 cv2.line(im0, (int(a['cx']), int(a['cy'])), (int(b['cx']), int(b['cy'])),
-                         (0, 0, 255), 3)
+                         (0, 0, 255), max(2, int(3 * k)))
                 lbl = f"CHAT {p_chat:.0%}" if jepa_enc is not None else f"CHAT {p_chat:.0f}°"
                 cv2.putText(im0, lbl,
-                            (int((a['cx'] + b['cx']) / 2) - 20, int((a['cy'] + b['cy']) / 2) - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                            (int((a['cx'] + b['cx']) / 2) - int(20 * k), int((a['cy'] + b['cy']) / 2) - int(10 * k)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6 * k, (0, 0, 255), max(2, int(2 * k)), cv2.LINE_AA)
                 for p in (a, b):
                     x1, y1, x2, y2 = p['bbox']
-                    cv2.rectangle(im0, (x1 - 4, y1 - 4), (x2 + 4, y2 + 4), (0, 0, 255), 3)
+                    cv2.rectangle(im0, (x1 - 4, y1 - 4), (x2 + 4, y2 + 4), (0, 0, 255), max(2, int(3 * k)))
             for (i, j) in yellow:
                 a, b = heads[i], heads[j]
                 for p in (a, b):
                     x1, y1, x2, y2 = p['bbox']
-                    cv2.rectangle(im0, (x1 - 4, y1 - 4), (x2 + 4, y2 + 4), (0, 255, 255), 2)
-                cv2.putText(im0, "?", (int((a['cx'] + b['cx']) / 2) - 10, int((a['cy'] + b['cy']) / 2) - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-            cv2.putText(im0, f"{len(heads)} Heads | {len(confirmed)} CHAT | {len(yellow)} ?", (5, 25),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+                    cv2.rectangle(im0, (x1 - 4, y1 - 4), (x2 + 4, y2 + 4), (0, 255, 255), max(2, int(2 * k)))
+                cv2.putText(im0, "?", (int((a['cx'] + b['cx']) / 2) - int(10 * k), int((a['cy'] + b['cy']) / 2) - int(10 * k)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6 * k, (0, 255, 255), max(2, int(2 * k)), cv2.LINE_AA)
 
-            # 桌线可视化 (仅 desk 模式): 绿色直线 = 拟合出的桌线, 用于人工核对
+            # ===== 9. 左上角结果面板 (半透明圆角底板 + 大号数字, 自动缩放) =====
             if SEAT_MODE == "desk":
                 L0 = max(img_w, img_h) * 0.8
                 if desk_frame.has_lines():
-                    for k, (mx, my, dx, dy, npts, ang) in enumerate(desk_frame.lines):
+                    for kk, (mx, my, dx, dy, npts, ang) in enumerate(desk_frame.lines):
                         cv2.line(im0, (int(mx - dx * L0), int(my - dy * L0)),
                                  (int(mx + dx * L0), int(my + dy * L0)), (0, 255, 0), 1, cv2.LINE_AA)
-                    cv2.putText(im0, f"desk lines: {len(desk_frame.lines)}", (5, 55),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    hud_sub = f"座位: 桌线 {len(desk_frame.lines)} 条"
                 elif DESK_ANGLE_MANUAL is not None:
                     t = math.radians(DESK_ANGLE_MANUAL)
                     ux, uy = math.cos(t), math.sin(t)
                     cx0, cy0 = img_w / 2.0, img_h / 2.0
                     cv2.line(im0, (int(cx0 - ux * L0), int(cy0 - uy * L0)),
                              (int(cx0 + ux * L0), int(cy0 + uy * L0)), (0, 255, 0), 1, cv2.LINE_AA)
-                    cv2.putText(im0, f"desk {DESK_ANGLE_MANUAL:.0f}deg", (5, 55),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    hud_sub = f"座位: 桌向 {DESK_ANGLE_MANUAL:.0f}°"
                 else:
-                    cv2.putText(im0, "desk: waiting (feet pts...)", (5, 55),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
+                    hud_sub = "座位: 桌线拟合中"
             elif SEAT_MODE == "depth":
-                cv2.putText(im0, f"seat: depth<={SEAT_DEPTH_RATIO_MAX}", (5, 55),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
+                hud_sub = f"座位: 深度比 ≤ {SEAT_DEPTH_RATIO_MAX:g}"
+            else:
+                hud_sub = ""
 
             annotated = cv2.resize(im0, (out_w, out_h))
+            draw_hud(annotated, len(heads), len(confirmed), len(yellow), hud_sub)   # 在输出分辨率上画, 又快又清晰
             writer.write(annotated)
 
-        writer.release()
-        stage3 = "JEPA确认" if jepa_enc is not None else "视线夹角确认"
-        print(f"已保存: {out_path}  (原始 {total_raw} 对次 → 可疑 {total_susp} 对次 → {stage3} {total_conf} 对次)")
+            # 进度条后缀: 当前帧结果 + 距离自动取消还剩多久
+            try:
+                post = f"人头 {len(heads)} | 确认 {len(confirmed)}"
+                if TIMEOUT_MIN > 0:
+                    left = TIMEOUT_MIN * 60.0 - (time.time() - t_video)
+                    post += f" | 剩余 {max(0.0, left) / 60.0:.1f}分自动取消"
+                bar.set_postfix_str(post)
+            except Exception:
+                pass
 
-    print("\n全部完成!")
+        bar.close()
+        writer.release()
+        elapsed = time.time() - t_video
+        stage3 = "JEPA确认" if jepa_enc is not None else "视线夹角确认"
+        if timed_out:
+            info = (f"[超时] {name}: 已用 {elapsed / 60.0:.1f} 分钟 > 上限 {TIMEOUT_MIN:g} 分钟, "
+                    f"取消该视频; 半成品: {out_path}")
+            if DELETE_PARTIAL:
+                try:
+                    if os.path.exists(out_path):
+                        os.remove(out_path)
+                    info = (f"[超时] {name}: 已用 {elapsed / 60.0:.1f} 分钟 > 上限 {TIMEOUT_MIN:g} 分钟, "
+                            f"已取消并删除半成品")
+                except Exception as e:
+                    info += f" (删除半成品失败: {e})"
+            print("\n" + info)
+            if STOP_ON_TIMEOUT:
+                print("[超时] 已按 --stop-on-timeout 退出整个脚本")
+                stopped_early = True
+                break
+        else:
+            print(f"已保存: {out_path}  (原始 {total_raw} 对次 → 可疑 {total_susp} 对次 → "
+                  f"{stage3} {total_conf} 对次, 用时 {elapsed / 60.0:.1f} 分钟)")
+
+    print("\n已结束 (因超时提前退出)!" if stopped_early else "\n全部完成!")

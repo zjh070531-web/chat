@@ -51,6 +51,19 @@ __pycache__/
 .eggs/
 *.egg
 
+# ---------- 本地临时产物 / 调试截图 (不随代码入库) ----------
+preview_*.png
+pose_compare.png
+person_raw.png
+person_*.png
+_hud_test*.png
+_pos_test.png
+屏幕截图*.jpg
+屏幕截图*.png
+hud_position.json
+_pose/
+_dbg/
+
 # ---------- 虚拟环境 ----------
 .venv/
 venv/

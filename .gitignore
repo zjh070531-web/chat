@@ -108,3 +108,20 @@ Thumbs.db:encryptable
 .idea/
 .vscode/
 *.swp
+
+# ---------- 数据集与中间产物 (2026-11-18 补充) ----------
+# 用户自筛的成品数据集 pos/neg 各 800+ 片段, 合计 361MB, 只留本地
+dataset/
+# 旧版二分类数据集 (1.9GB) 与 JEPA 训练用的 CSV
+my_dataset/
+# 诊断脚本与抽帧截图
+_probe/
+_pack/
+# 桌面自动化插件的截图缓存
+.dsh-pilot/
+# clip 采样工具自带的 ffmpeg (83MB) 与导出目录
+clip/ffmpeg.exe
+clip/dataset/
+clip/__pycache__/
+# 根目录这份 main.py 与 clip/main.py 完全相同, 只保留带 README 的 clip/ 版本
+/main.py

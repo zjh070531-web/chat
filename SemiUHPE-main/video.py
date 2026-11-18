@@ -98,9 +98,9 @@ def post_process_batch(imgs, paths, shapes, body_dets, part_dets, num_offsets, m
 # 不再写死本机绝对路径, 换机器 / clone 仓库后可直接用
 VIDEO_DIR = os.environ.get(
     "CHATTING_VIDEO_DIR",
-    r"D:\video\2\教室中后-右\教室中后_右_802监控_802监控_20260830161715"
+    r"D:\video\2\教室中后-右\cutting"
 )  # 输入视频目录(或单个视频文件)
-OUTPUT_DIR = os.environ.get("CHATTING_OUTPUT_DIR", r"D:\chatting\outputs(13)")  # 输出目录
+OUTPUT_DIR = os.environ.get("CHATTING_OUTPUT_DIR", r"D:\chatting\outputs(15)")  # 输出目录
 FRAME_SKIP = 3                                      # 每3帧处理1帧 (提速; 输出视频时长不变)
 
 # ---- 检测 (防椅子靠背被当成人头) ----
@@ -166,15 +166,19 @@ SMOOTH_MATCH_DIST = 0.8       # 跨帧"同一个配对"的匹配上限 (×平均
 # ---- ②第二阶段: JEPA 二次确认 (视线夹角抓可疑 → JEPA 判"是否真在说话") ----
 # 思路: 第一段(视线夹角)只负责"抓可疑配对", 第二段用你训练的 V-JEPA 二分类模型
 #       (chatting/not_chatting) 裁剪"两人区域"的 16 帧 clip 再判一次, 过阈值才算确认。
-JEPA_ENABLE = False           # 关掉 = 退回只靠视线夹角的旧版 (2026-09-29 暂时关闭, 只留第一阶段视线夹角)
-# JEPA 代码与权重不随本仓库分发, 用环境变量指过去 (JEPA_ENABLE=True 时必须设置 JEPA_ROOT)
-JEPA_ROOT = os.environ.get("JEPA_ROOT", "")  # V-JEPA 代码根目录 (src/ 在这里)
-JEPA_BACKBONE = os.environ.get("JEPA_BACKBONE", os.path.join(JEPA_ROOT, "pretrained_weights", "vitl16.pth.tar"))  # 冻结主干
-JEPA_HEAD = os.environ.get("JEPA_HEAD", os.path.join(JEPA_ROOT, "pretrained_weights", "video_classification_frozen", "ssv2-16x2x3", "jepa-best.pth.tar"))  # 分类头(best)
-JEPA_CONFIRM_THRESH = 0.5     # P(交头接耳) ≥ 该值才最终确认 (0.5=取argmax; 调高更严)
-JEPA_FRAMES = 16              # 采 16 帧 (与训练一致)
-JEPA_FRAME_STEP = 4           # 帧步长 4 → 16×4=64 帧 ≈ 3.2s 的时间窗
-JEPA_BUF_MAX = 64             # 帧缓冲上限(原始帧数), 存 720p 降采样
+JEPA_ENABLE = True            # 默认开启; 命令行 --no-jepa 退回只靠视线夹角的旧版
+# JEPA 代码与权重不随本仓库分发, 默认按下面的路径找; 可用环境变量或命令行覆盖
+JEPA_ROOT = os.environ.get("JEPA_ROOT", r"D:\jepa-main")  # V-JEPA 代码根目录 (src/ 在这里)
+JEPA_BACKBONE = os.environ.get("JEPA_BACKBONE", os.path.join(JEPA_ROOT, "pretrained_weights", "vitl16.pth.tar"))  # 冻结主干 ViT-L/16
+# 分类头(best/latest): 默认用 2026-11-04 训练的 chatting-ssv2-v2b
+#   SSv2 探针热启动 + 16×2×1 + 按源簇划分的 my_dataset_v2 (无同源泄漏)
+#   val_acc 100% / val_loss 0.2073 —— 用 latest(ep6), 因为 best 停在 val_acc 首次达 100% 的 ep1
+JEPA_HEAD = os.environ.get("JEPA_HEAD", os.path.join(
+    JEPA_ROOT, "pretrained_weights", "video_classification_frozen", "chatting-ssv2-v2b", "jepa-latest.pth.tar"))
+JEPA_CONFIRM_THRESH = 0.5     # P(交头接耳) ≥ 该值才最终确认 (0.5=取argmax; 命令行 --jepa-thresh 调高更严)
+JEPA_FRAMES = 16              # 采 16 帧 (与训练 frames_per_clip 一致)
+JEPA_FRAME_STEP = 3           # 训练端 frame_step (ssv2-v2b 用 3); 缓冲里相邻两个"处理帧"实际间隔就是 FRAME_SKIP 个原始帧
+JEPA_BUF_MAX = 64             # 帧缓冲上限(处理帧数), 存 720p 降采样
 JEPA_RERUN_INTERVAL = 60      # 同一配对每隔多少原始帧才重跑一次 JEPA (节流, 60≈3秒)
                               # 裁剪规格见上面 PAIR_CROP_K / PAIR_CROP_DY / PAIR_PREP_SIZE
 
@@ -640,14 +644,22 @@ def jepa_predict_pair(encoder, classifier, buf, region, device):
     """对"两人区域"跑 JEPA, 返回 (P交头接耳, 预测类别)。
 
     buf: 720p BGR 帧缓冲 (list/deque); region: (x1,y1,x2,y2) 720p 坐标。
+
+    取帧方式: 用缓冲里**最近**的 JEPA_FRAMES 个处理帧。
+    缓冲里存的是"处理帧"(主循环每 FRAME_SKIP 个原始帧才 append 一个), 所以
+    16 个处理帧 ≈ 16×FRAME_SKIP = 48 个原始帧, 与训练端(16 帧 × frame_step 3)
+    的时间跨度一致。早先用 linspace(0, len(buf)-1) 跨整个 64 帧缓冲, 窗口会拉到
+    ~9.6 秒, 是训练窗口的 4 倍, 模型看到的运动幅度完全失真。
     """
-    idx = np.linspace(0, len(buf) - 1, JEPA_FRAMES).astype(int)
+    if len(buf) < JEPA_FRAMES:
+        return 0.0, 0
     x1, y1, x2, y2 = region
     if x2 - x1 < 8 or y2 - y1 < 8:
         return 0.0, 0
+    frames = list(buf)[-JEPA_FRAMES:]
     crops = []
-    for i in idx:
-        c = buf[i][y1:y2, x1:x2]
+    for fr in frames:
+        c = fr[y1:y2, x1:x2]
         if c.size == 0 or min(c.shape[:2]) < 8:
             return 0.0, 0
         crops.append(pair_prep(c))
@@ -974,10 +986,30 @@ if __name__ == '__main__':
                      help="把每一对判定成交头接耳的判据数值打印出来 (排查误报用)")
     _ap.add_argument("--hud-pos", type=str, default=None,
                      help="直接指定面板位置, 格式 'x,y' (0~1 的画面比例), 例: --hud-pos 0.02,0.02")
+    _ap.add_argument("--no-jepa", action="store_true",
+                     help="关闭 JEPA 二次确认, 只用视线夹角判据 (旧行为)")
+    _ap.add_argument("--jepa-thresh", type=float, default=JEPA_CONFIRM_THRESH,
+                     help=f"P(交头接耳) 确认阈值, 越高越严 (默认 {JEPA_CONFIRM_THRESH})")
+    _ap.add_argument("--jepa-head", type=str, default=None,
+                     help="分类头权重 .pth.tar 路径 (默认: chatting-ssv2-v2b/jepa-latest.pth.tar)")
+    _ap.add_argument("--jepa-root", type=str, default=None,
+                     help=r"JEPA 仓库根目录, 里面有 src/ 和 pretrained_weights/ (默认 D:\jepa-main)")
     _args = _ap.parse_args()
     VIDEO_DIR, OUTPUT_DIR = _args.video_dir, _args.output_dir
     TIMEOUT_MIN, STOP_ON_TIMEOUT, DELETE_PARTIAL = _args.timeout_min, _args.stop_on_timeout, _args.delete_partial
     DEBUG_PAIRS = _args.debug_pairs
+    # ---- JEPA 二次确认的开关与路径 (命令行优先于环境变量/默认值) ----
+    if _args.no_jepa:
+        JEPA_ENABLE = False
+    if _args.jepa_root:
+        JEPA_ROOT = _args.jepa_root
+        if not _args.jepa_head:
+            JEPA_BACKBONE = os.path.join(JEPA_ROOT, "pretrained_weights", "vitl16.pth.tar")
+            JEPA_HEAD = os.path.join(JEPA_ROOT, "pretrained_weights", "video_classification_frozen",
+                                     "chatting-ssv2-v2b", "jepa-latest.pth.tar")
+    if _args.jepa_head:
+        JEPA_HEAD = _args.jepa_head
+    JEPA_CONFIRM_THRESH = _args.jepa_thresh
     if _args.hud_pos:
         try:
             _hx, _hy = [float(v) for v in _args.hud_pos.replace("，", ",").split(",")[:2]]
@@ -993,6 +1025,17 @@ if __name__ == '__main__':
     else:                                               # 指向目录: 处理里面所有 mp4
         video_files = sorted(glob.glob(os.path.join(VIDEO_DIR, "*.mp4")))
     print(f"[输入] {VIDEO_DIR}\n[输出] {OUTPUT_DIR}\n[视频] {len(video_files)} 个")
+    if JEPA_ENABLE:
+        print(f"[JEPA] 二次确认开启  阈值 P≥{JEPA_CONFIRM_THRESH:.2f}  窗口 {JEPA_FRAMES} 帧")
+        print(f"[JEPA]   主干 {JEPA_BACKBONE}")
+        print(f"[JEPA]   分类头 {JEPA_HEAD}")
+        for _tag, _p in (("主干", JEPA_BACKBONE), ("分类头", JEPA_HEAD)):
+            if not os.path.isfile(_p):
+                print(f"[JEPA]   !! {_tag} 不存在: {_p}  (可用 --jepa-root / --jepa-head 指定)")
+        if not os.path.isdir(os.path.join(JEPA_ROOT, "src")):
+            print(f"[JEPA]   !! JEPA_ROOT 下没有 src/: {JEPA_ROOT}")
+    else:
+        print("[JEPA] 已关闭 (--no-jepa), 只用视线夹角判据")
     if HUD_ENABLE:
         print(f"[HUD] 面板位置 x={HUD_OFFSET_X:.3f}, y={HUD_OFFSET_Y:.3f}"
               + (" (来自 hud_position.json)" if load_hud_pos() is not None else " (默认)")
@@ -1254,6 +1297,10 @@ if __name__ == '__main__':
                         r720 = (int(r[0] * sx), int(r[1] * sy), int(r[2] * sx), int(r[3] * sy))
                         p_chat, _ = jepa_predict_pair(jepa_enc, jepa_clf, jepa_buf, r720, DEVICE)
                         jepa_cache[tid] = {'fi': fi, 'p_chat': p_chat}
+                        if DEBUG_PAIRS:
+                            print(f"[JEPA] f{fi} 头{i}-头{j}: P(交头接耳)={p_chat:.3f} "
+                                  f"→ {'确认' if p_chat >= JEPA_CONFIRM_THRESH else '否决'}"
+                                  f"  (阈值 {JEPA_CONFIRM_THRESH:.2f}, 区域 {r720})")
                     else:
                         p_chat = c['p_chat']
                     if p_chat >= JEPA_CONFIRM_THRESH:
